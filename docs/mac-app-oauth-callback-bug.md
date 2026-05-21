@@ -1,12 +1,19 @@
 # Mac App OAuth Callback Bug Investigation
 
-Status: investigation note only. No code fix is included in this change.
+Status: investigation note plus partial fix. The callback page's close button now
+returns to the dashboard instead of attempting to close the native app window;
+the full live Google OAuth marker-loss path remains unresolved.
+Computer Use verification on 2026-05-21 confirmed part of the user-visible
+failure path. The full live Google OAuth marker-loss path still needs account
+authorization to verify end-to-end.
 
 ## User-visible symptoms
 
 - After signing in with Google from the macOS app, the OAuth callback page can show
   "Sign-in incomplete. Please try again." instead of the success/returning state.
-- The callback page's "Close this page" button does not close the macOS app window.
+- The callback page's "Close this page" button should leave the failed callback
+  route and return to the dashboard. Previously it attempted to close the page,
+  which is the wrong product behavior for the macOS app window.
 - Closing the macOS dashboard window with the red window control and then choosing
   "Open Dashboard" from the menu bar popover can reopen the same failed callback
   page instead of the dashboard.
@@ -14,6 +21,42 @@ Status: investigation note only. No code fix is included in this change.
   application may fail to bring that other application visually in front. The
   TokenTracker dashboard can remain the visible frontmost window, effectively
   blocking normal app switching.
+
+## Computer Use verification, 2026-05-21
+
+The verification avoided a real Google OAuth login to prevent sending account
+authorization data. Instead, it used a fake deep link:
+`tokentracker://auth/callback?insforge_code=codex-verification-fake-code`.
+This exercises the same native `handleAuthCallback(code:)` path and loads
+`/auth/callback?insforge_code=...` inside the existing `WKWebView`, but it does
+not prove whether the real browser callback loses the native marker.
+
+Confirmed:
+
+- TokenTrackerBar was running from `/Applications/TokenTrackerBar.app`
+  (`com.tokentracker.bar`).
+- Opening the fake callback deep link showed the macOS app dashboard window at
+  `localhost:7680/auth/callback`.
+- The page first displayed the processing state, then fell into the localized
+  failure state: "登录未完成，请重试。" ("Sign-in incomplete. Please try again.").
+- Clicking the page-level "关闭此页" ("Close this page") button did not leave the
+  failed callback page. The same failed callback page remained visible.
+- Opening `tokentracker://auth/done` restored the window to the normal dashboard
+  URL, `localhost:7680/?app=1`, which is a useful manual recovery path during
+  investigation.
+
+Not confirmed in this pass:
+
+- Whether the real OAuth flow's `PUT /api/auth-bridge/verifier` succeeds before
+  the system browser opens.
+- Whether the system browser callback receives `{ "native": true }` from
+  `GET /api/auth-bridge/verifier`.
+- Whether the real failed callback logs `PKCE_VERIFIER_MISSING`.
+- The sticky reopen behavior via the status-bar "Open Dashboard" menu item.
+  The failed page was confirmed to remain after its own close button, but the
+  status-bar menu reopen path was not completed during this pass.
+- The severe window-ordering symptom was not reproduced in this pass. After the
+  dashboard was open, activating Finder brought Finder visually to the front.
 
 ## Expected macOS app flow
 
@@ -55,7 +98,8 @@ session, not in the browser session.
     `tokentracker://auth/callback?insforge_code=...`.
   - Web flow waits for `signedIn`; if it never becomes true, it shows the
     "Sign-in incomplete" state.
-  - The close button only calls `window.close()`.
+  - The close button returns to `/dashboard` with route replacement, keeping the
+    macOS dashboard window open.
 
 - `TokenTrackerBar/TokenTrackerBar/Services/DashboardWindowController.swift`
   - The `nativeOAuth` handler opens the OAuth URL in the system browser.
@@ -101,23 +145,25 @@ There appear to be two separate issues:
    window-lifecycle regression because it can make other apps appear
    inaccessible behind the dashboard.
 
-The "Close this page" button on the callback page is also not sufficient for the
-macOS app because `window.close()` does not close the native `NSWindow`. It is
-also unreliable in normal browsers unless the page was opened by script.
+The "Close this page" button should not close the native `NSWindow` in the
+macOS app. It should dismiss only the callback route and return the user to the
+dashboard.
 
 ## Suggested verification before fixing
 
-- In the macOS app, inspect whether `PUT /api/auth-bridge/verifier` succeeds
-  before the system browser opens.
-- Confirm whether the system browser callback receives
+- Still needed: in the macOS app, inspect whether
+  `PUT /api/auth-bridge/verifier` succeeds before the system browser opens.
+- Still needed: confirm whether the system browser callback receives
   `{ "native": true }` from `GET /api/auth-bridge/verifier`.
-- Confirm whether the failed callback page logs the SDK error
+- Still needed: confirm whether the failed callback page logs the SDK error
   `PKCE_VERIFIER_MISSING`.
-- Confirm that reopening from the menu bar calls `showWindow()` on an existing
-  window and does not reload `Constants.serverBaseURL + "?app=1"`.
-- With the dashboard window open, click another app and inspect whether
-  TokenTracker remains visually above the target app even after losing key
-  status.
+- Partially confirmed: a failed callback page loaded in the native window and
+  the page-level close button did not leave that route. Re-verify that the fixed
+  button returns to `/dashboard` in the native window.
+- Recheck if reported again: with the dashboard window open, click another app
+  and inspect whether TokenTracker remains visually above the target app even
+  after losing key status. Finder activation worked correctly in the
+  2026-05-21 Computer Use pass.
 - Check the runtime `NSWindow.level`, activation policy, and key/main window
   state before and after clicking another app.
 - Verify whether adding or restoring an app-deactivation/window-ordering path is
