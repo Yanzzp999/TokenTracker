@@ -10,6 +10,10 @@ Status: investigation note only. No code fix is included in this change.
 - Closing the macOS dashboard window with the red window control and then choosing
   "Open Dashboard" from the menu bar popover can reopen the same failed callback
   page instead of the dashboard.
+- High impact: after the macOS dashboard window is open, clicking another
+  application may fail to bring that other application visually in front. The
+  TokenTracker dashboard can remain the visible frontmost window, effectively
+  blocking normal app switching.
 
 ## Expected macOS app flow
 
@@ -58,6 +62,9 @@ session, not in the browser session.
   - `handleAuthCallback(code:)` loads `/auth/callback?insforge_code=...` in the
     app WebView so the SDK can exchange the code in the correct session.
   - `showWindow()` reuses the existing `NSWindow`/`WKWebView` if present.
+  - `showWindow()` switches the app to `.regular`, calls
+    `window.makeKeyAndOrderFront(nil)`, then force-activates with
+    `NSApp.activate(ignoringOtherApps: true)`.
   - `windowWillClose` intentionally keeps the WebView and window alive to
     preserve cookies and login state.
 
@@ -84,6 +91,16 @@ There appear to be two separate issues:
    reuses the same WebView without navigating back to `/?app=1` or `/dashboard`.
    Therefore the old `/auth/callback` failure page is shown again.
 
+3. The dashboard window may not yield correctly to other macOS apps.
+   The current window-opening path force-activates TokenTracker with
+   `NSApp.activate(ignoringOtherApps: true)`. There is no matching app
+   deactivation handler in the inspected code path that orders the dashboard
+   behind, hides it, or restores accessory behavior when the user clicks another
+   app. Although no explicit floating window level was found in
+   `DashboardWindowController`, this symptom should be treated as a severe
+   window-lifecycle regression because it can make other apps appear
+   inaccessible behind the dashboard.
+
 The "Close this page" button on the callback page is also not sufficient for the
 macOS app because `window.close()` does not close the native `NSWindow`. It is
 also unreliable in normal browsers unless the page was opened by script.
@@ -98,4 +115,11 @@ also unreliable in normal browsers unless the page was opened by script.
   `PKCE_VERIFIER_MISSING`.
 - Confirm that reopening from the menu bar calls `showWindow()` on an existing
   window and does not reload `Constants.serverBaseURL + "?app=1"`.
-
+- With the dashboard window open, click another app and inspect whether
+  TokenTracker remains visually above the target app even after losing key
+  status.
+- Check the runtime `NSWindow.level`, activation policy, and key/main window
+  state before and after clicking another app.
+- Verify whether adding or restoring an app-deactivation/window-ordering path is
+  needed, or whether the issue comes from a specific window level/state set
+  outside `DashboardWindowController`.
