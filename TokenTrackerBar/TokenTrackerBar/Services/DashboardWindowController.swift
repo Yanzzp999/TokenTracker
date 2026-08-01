@@ -323,10 +323,22 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
     }
 
     func closeWindow() {
+        returnToMenuBarMode()
         window?.performClose(nil)
     }
 
     // MARK: - NSWindowDelegate
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard let window, sender === window else { return true }
+
+        // The Dashboard makes the app a regular app so it can own a primary
+        // window. Switch back before the traffic-light close transition starts:
+        // on recent macOS releases, changing the activation policy from
+        // `windowWillClose` can leave the Dock tile visible until focus changes.
+        returnToMenuBarMode()
+        return true
+    }
 
     func windowWillClose(_ notification: Notification) {
         // Keep webView and window alive so cookies/login state persist.
@@ -338,10 +350,16 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
                 && $0 != closingWindow
             }
             if !hasOtherVisibleWindows {
-                NSApp.setActivationPolicy(.accessory)
                 NSApp.hide(nil)
             }
         }
+    }
+
+    /// Returns the app to its normal menu-bar-agent mode without terminating
+    /// the process, so syncing and the status item keep running.
+    private func returnToMenuBarMode() {
+        guard NSApp.activationPolicy() != .accessory else { return }
+        _ = NSApp.setActivationPolicy(.accessory)
     }
 
     // MARK: - WKScriptMessageHandler
