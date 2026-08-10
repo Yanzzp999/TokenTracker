@@ -68,7 +68,7 @@ test("reopening the macOS menu bar app always restores the dashboard", () => {
   )?.[0];
 
   assert.ok(reopenHandler, "AppDelegate should handle Finder/Dock reopen events");
-  assert.match(reopenHandler, /DashboardWindowController\.shared\.showWindow\(\)/);
+  assert.match(reopenHandler, /DashboardPresentationCoordinator\.shared\.showDashboard\(\)/);
   assert.match(
     reopenHandler,
     /return false/,
@@ -89,5 +89,5 @@ test("a normal macOS launch opens the dashboard but a login-item launch stays qu
 
   assert.ok(launchHandler, "AppDelegate should configure initial launch behavior");
   assert.match(launchHandler, /keyAELaunchedAsLogInItem/);
-  assert.match(launchHandler, /DashboardWindowController\.shared\.showWindow\(\)/);
+  assert.match(launchHandler, /DashboardPresentationCoordinator\.shared\.showDashboard\(\)/);
 });
