@@ -1120,7 +1120,7 @@ final class StatusBarController: NSObject {
     }
 
     @objc private func openDashboard() {
-        DashboardWindowController.shared.showWindow()
+        DashboardPresentationCoordinator.shared.showDashboard()
     }
 
     @objc private func openDashboardSettings() {

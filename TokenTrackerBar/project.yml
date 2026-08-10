@@ -129,6 +129,7 @@ targets:
       - path: TokenTrackerBar/Models/BackgroundRefreshPolicy.swift
       - path: TokenTrackerBar/Models/SyncRequestPolicy.swift
       - path: TokenTrackerBar/Models/UsagePublicationPolicy.swift
+      - path: TokenTrackerBar/Models/DashboardPresentationPolicy.swift
       - path: TokenTrackerBar/Services/ResumableDownloader.swift
       - path: TokenTrackerBar/Services/QueueActivityMonitor.swift
       - path: TokenTrackerBar/Models/CompanionAnimationPolicy.swift

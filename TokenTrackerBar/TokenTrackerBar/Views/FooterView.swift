@@ -10,7 +10,7 @@ struct FooterView: View {
     var body: some View {
         HStack(spacing: 12) {
             Button {
-                DashboardWindowController.shared.showWindow()
+                DashboardPresentationCoordinator.shared.showDashboard()
             } label: {
                 HStack(spacing: 3) {
                     Image(systemName: "macwindow")

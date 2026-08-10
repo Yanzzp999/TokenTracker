@@ -39,13 +39,14 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
 
     // MARK: - Public
 
-    func showWindow() {
+    /// Window-only presentation. App-wide activation/Dock policy is owned by
+    /// `DashboardPresentationCoordinator` so every open/close entry shares the
+    /// same lifecycle contract.
+    func presentWindow() {
         // Close the menu bar popover.
         for window in NSApp.windows where window.className.contains("Popover") {
             window.close()
         }
-
-        NSApp.setActivationPolicy(.regular)
 
         // Reuse existing window if possible
         if let window {
@@ -328,20 +329,17 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
 
     // MARK: - NSWindowDelegate
 
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard sender === window else { return true }
+        return DashboardPresentationCoordinator.shared.dashboardWindowShouldClose()
+    }
+
     func windowWillClose(_ notification: Notification) {
-        // Keep webView and window alive so cookies/login state persist.
-        DispatchQueue.main.async { [weak self] in
-            let closingWindow = self?.window
-            let hasOtherVisibleWindows = NSApp.windows.contains {
-                $0.isVisible
-                && !$0.isKind(of: NSPanel.self)
-                && $0 != closingWindow
-            }
-            if !hasOtherVisibleWindows {
-                NSApp.setActivationPolicy(.accessory)
-                NSApp.hide(nil)
-            }
-        }
+        guard let closingWindow = notification.object as? NSWindow,
+              closingWindow === window else { return }
+        // Keep webView and window alive so cookies/login state persist. The
+        // coordinator schedules only the app-level post-close transition.
+        DashboardPresentationCoordinator.shared.dashboardWindowWillClose()
     }
 
     // MARK: - WKScriptMessageHandler
@@ -371,7 +369,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
 
     /// Open the dashboard and navigate directly to the Settings page.
     func showSettings() {
-        showWindow()
+        DashboardPresentationCoordinator.shared.showDashboard()
         if let url = URL(string: Constants.serverBaseURL + "/settings?app=1") {
             webView?.load(URLRequest(url: url))
         }
@@ -379,7 +377,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
 
     /// Called when `tokentracker://auth/done` deep link is received after browser login.
     func handleAuthDone() {
-        showWindow()
+        DashboardPresentationCoordinator.shared.showDashboard()
         // Reload dashboard so InsForge SDK picks up session from server-side cookie relay
         if let url = URL(string: Constants.serverBaseURL + "?app=1") {
             webView?.load(URLRequest(url: url))
@@ -390,7 +388,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
     /// Loads the callback page in the WebView so the SDK can exchange the code using the
     /// PKCE verifier that's already in WebView's sessionStorage.
     func handleAuthCallback(code: String) {
-        showWindow()
+        DashboardPresentationCoordinator.shared.showDashboard()
         let encoded = code.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? code
         let callbackUrl = Constants.serverBaseURL + "/auth/callback?insforge_code=\(encoded)"
         if let url = URL(string: callbackUrl) {

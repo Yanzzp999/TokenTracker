@@ -140,7 +140,7 @@ final class DesktopPetWindowController: NSObject, NSWindowDelegate {
                 content: ClawdCompanionView(
                     viewModel: viewModel,
                     layout: .floating,
-                    onRequestDashboard: { DashboardWindowController.shared.showWindow() },
+                    onRequestDashboard: { DashboardPresentationCoordinator.shared.showDashboard() },
                     onClosePet: { [weak self] in self?.hide() },
                     onHoverChanged: { [weak self] hovering in self?.handleHover(hovering) },
                     onKeepActive: { [weak self] in self?.keepActive() },
