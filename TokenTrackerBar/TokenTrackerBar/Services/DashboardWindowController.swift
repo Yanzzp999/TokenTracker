@@ -323,8 +323,14 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
         }
     }
 
-    func closeWindow() {
-        window?.performClose(nil)
+    /// Requests a close only when the Dashboard is currently visible.
+    /// Returning whether a close began lets Cmd+Q fall back to a real app quit
+    /// when the menu-bar agent has no Dashboard window to close.
+    @discardableResult
+    func closeWindow() -> Bool {
+        guard let window, window.isVisible else { return false }
+        window.performClose(nil)
+        return true
     }
 
     // MARK: - NSWindowDelegate

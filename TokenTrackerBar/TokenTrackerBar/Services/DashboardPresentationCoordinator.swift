@@ -19,7 +19,8 @@ final class DashboardPresentationCoordinator {
 
     /// Cmd+Q and any future explicit "Close Dashboard" action use the same
     /// `windowShouldClose` path as the traffic-light close button.
-    func closeDashboard() {
+    @discardableResult
+    func closeDashboard() -> Bool {
         DashboardWindowController.shared.closeWindow()
     }
 

@@ -104,8 +104,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DashboardPresentationCoordinator.shared.prepareForTermination()
             return .terminateNow
         }
-        DashboardPresentationCoordinator.shared.closeDashboard()
-        return .terminateCancel
+        if DashboardPresentationCoordinator.shared.closeDashboard() {
+            return .terminateCancel
+        }
+        DashboardPresentationCoordinator.shared.prepareForTermination()
+        return .terminateNow
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

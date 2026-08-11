@@ -24,6 +24,13 @@ const desktopPetWindowControllerPath = path.join(
   "Services",
   "DesktopPetWindowController.swift",
 );
+const dashboardPresentationCoordinatorPath = path.join(
+  repoRoot,
+  "TokenTrackerBar",
+  "TokenTrackerBar",
+  "Services",
+  "DashboardPresentationCoordinator.swift",
+);
 
 function read(filePath) {
   return fs.readFileSync(filePath, "utf8");
@@ -90,4 +97,34 @@ test("a normal macOS launch opens the dashboard but a login-item launch stays qu
   assert.ok(launchHandler, "AppDelegate should configure initial launch behavior");
   assert.match(launchHandler, /keyAELaunchedAsLogInItem/);
   assert.match(launchHandler, /DashboardPresentationCoordinator\.shared\.showDashboard\(\)/);
+});
+
+test("Cmd+Q exits when no visible Dashboard close can begin", () => {
+  const appDelegateSource = read(appDelegatePath);
+  const coordinatorSource = read(dashboardPresentationCoordinatorPath);
+  const dashboardWindowControllerSource = read(dashboardWindowControllerPath);
+  const terminationHandler = appDelegateSource.match(
+    /func applicationShouldTerminate\([\s\S]*?\n    }\n\n    func applicationShouldHandleReopen/,
+  )?.[0];
+
+  assert.ok(terminationHandler, "AppDelegate should handle Cmd+Q termination requests");
+  assert.match(
+    terminationHandler,
+    /if DashboardPresentationCoordinator\.shared\.closeDashboard\(\) \{\s*return \.terminateCancel\s*}/,
+    "Cmd+Q should be cancelled only after a visible Dashboard close begins",
+  );
+  assert.match(
+    terminationHandler,
+    /DashboardPresentationCoordinator\.shared\.prepareForTermination\(\)\s*return \.terminateNow/,
+    "Cmd+Q should terminate when no Dashboard window exists or is already closed",
+  );
+  assert.match(
+    coordinatorSource,
+    /func closeDashboard\(\) -> Bool \{\s*DashboardWindowController\.shared\.closeWindow\(\)\s*}/,
+  );
+  assert.match(
+    dashboardWindowControllerSource,
+    /func closeWindow\(\) -> Bool \{\s*guard let window, window\.isVisible else \{ return false \}\s*window\.performClose\(nil\)\s*return true\s*}/,
+    "A hidden or absent Dashboard must report that no close began",
+  );
 });
