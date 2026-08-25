@@ -1,12 +1,12 @@
 {
-  "generatedAt": "2026-08-11T09:06:06.707Z",
+  "generatedAt": "2026-08-23T00:50:54.206Z",
   "root": "dashboard/src",
   "rules": {
     "colors": "hex/rgb(a) literals",
     "rawText": "JSX text nodes containing letters or digits"
   },
   "totals": {
-    "colors": 377,
+    "colors": 404,
     "rawText": 161
   },
   "files": {
@@ -84,6 +84,21 @@
     },
     "dashboard/src/hooks/use-trend-data.ts": {
       "colors": 1,
+      "rawText": 0,
+      "rawTextTokens": []
+    },
+    "dashboard/src/lib/bot/decor.ts": {
+      "colors": 1,
+      "rawText": 0,
+      "rawTextTokens": []
+    },
+    "dashboard/src/lib/bot/skins.ts": {
+      "colors": 12,
+      "rawText": 0,
+      "rawTextTokens": []
+    },
+    "dashboard/src/lib/bot-appearance.js": {
+      "colors": 2,
       "rawText": 0,
       "rawTextTokens": []
     },
@@ -370,7 +385,7 @@
       ]
     },
     "dashboard/src/ui/dashboard/components/ProviderIcon.jsx": {
-      "colors": 2,
+      "colors": 9,
       "rawText": 0,
       "rawTextTokens": []
     },
@@ -461,6 +476,16 @@
       ]
     },
     "dashboard/src/ui/dashboard/views/DashboardView.jsx": {
+      "colors": 2,
+      "rawText": 0,
+      "rawTextTokens": []
+    },
+    "dashboard/src/ui/foundation/BotAnimated.jsx": {
+      "colors": 3,
+      "rawText": 0,
+      "rawTextTokens": []
+    },
+    "dashboard/src/ui/foundation/BotAnimated.test.jsx": {
       "colors": 2,
       "rawText": 0,
       "rawTextTokens": []

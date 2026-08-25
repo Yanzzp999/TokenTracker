@@ -195,8 +195,9 @@ const MODEL_PRICING: Record<string, { input: number; output: number; cache_read:
   "MiniMax-M2.7": { input: 0.3, output: 1.2, cache_read: 0.06, cache_write: 0.375 },
   "MiniMax-M2.7-highspeed": { input: 0.6, output: 2.4, cache_read: 0.06, cache_write: 0.375 },
   "minimax-m3": { input: 0.3, output: 1.2, cache_read: 0.06, cache_write: 0 },
-  "deepseek-v4-flash": { input: 0.14, output: 0.28, cache_read: 0.0028, cache_write: 0.14 },
-  "deepseek-v4-pro": { input: 0.435, output: 0.87, cache_read: 0.003625, cache_write: 0.435 },
+  "deepseek-v4-flash": { input: 0.44, output: 1.32, cache_read: 0.014, cache_write: 0.44 },
+  "deepseek-v4-pro": { input: 1.32, output: 3.96, cache_read: 0.044, cache_write: 1.32 },
+  "deepseek-v4-flash-vision-exp": { input: 0.44, output: 1.32, cache_read: 0.014, cache_write: 0.44 },
   "deepseek-chat": { input: 0.14, output: 0.28, cache_read: 0.0028, cache_write: 0.14 },
   "deepseek-reasoner": { input: 0.14, output: 0.28, cache_read: 0.0028, cache_write: 0.14 },
   // ── xAI Grok (mirrored from src/lib/pricing/curated-overrides.json;
@@ -356,6 +357,32 @@ function getModelPricing(model: string) {
   return ZERO_PRICING;
 }
 
+function getRowPricing(row: { model?: string; hour_start?: string; pricing_tier?: string }) {
+  const pricing = getModelPricing(row.model || "");
+  const lower = String(row.model || "").toLowerCase();
+  if (!lower.includes("deepseek-v4-flash") && !lower.includes("deepseek-v4-pro")) return pricing;
+  let offPeak = row.pricing_tier === "off_peak";
+  if (!row.pricing_tier && row.hour_start) {
+    const timestamp = Date.parse(row.hour_start);
+    if (Number.isFinite(timestamp)) {
+      const hour = new Date(timestamp).getUTCHours();
+      offPeak = !((hour >= 1 && hour < 4) || (hour >= 6 && hour < 10));
+      // From 00:00 Beijing time on 2026-08-23 (2026-08-22T16:00Z) DeepSeek bills
+      // whole Beijing weekends off-peak, peak hours included. That weekend runs
+      // 16:00Z Friday to 16:00Z Sunday, so the +08:00 shift before getUTCDay()
+      // is what puts both edges in the right place; reading the weekday off the
+      // raw instant marks a different 48 hours. China has had no daylight saving
+      // since 1991. https://api-docs.deepseek.com/quick_start/pricing/
+      if (timestamp >= Date.UTC(2026, 7, 22, 16, 0, 0)) {
+        const beijingDay = new Date(timestamp + 8 * 60 * 60 * 1000).getUTCDay();
+        if (beijingDay === 0 || beijingDay === 6) offPeak = true;
+      }
+    }
+  }
+  if (!offPeak) return pricing;
+  return { input: pricing.input * 0.5, output: pricing.output * 0.5, cache_read: pricing.cache_read * 0.5, cache_write: (pricing.cache_write || 0) * 0.5 };
+}
+
 interface UsageRow {
   source: string;
   model: string;
@@ -366,6 +393,7 @@ interface UsageRow {
   cache_creation_input_tokens: number | null;
   reasoning_output_tokens: number | null;
   total_cost_usd?: number | null;
+  pricing_tier?: string;
 }
 
 // One row per (UTC day, source, model) as returned by account_usage_grouped
@@ -387,7 +415,7 @@ function computeRowCost(row: UsageRow): number {
     row.source === "workbuddy" && (row.model || "").toLowerCase() === "auto"
       ? "hy3-preview-agent"
       : row.model;
-  const p = getModelPricing(modelForPricing);
+  const p = getRowPricing({ ...row, model: modelForPricing });
   const reasoningIncludedInOutput = row.source === "codex" || row.source === "every-code";
   const reasoningCost = reasoningIncludedInOutput
     ? 0
@@ -421,7 +449,7 @@ function canonicalSource(s: string) {
 // RPC, and tokentracker-leaderboard-refresh.ts
 // (parity: test/account-source-parity.test.js).
 // deno-lint-ignore no-unused-vars
-const ACCOUNT_LEVEL_SOURCES = new Set<string>(["cursor"]);
+const ACCOUNT_LEVEL_SOURCES = new Set<string>(["cursor", "trae-cn"]);
 
 // ─────────────────────────── Window bounds ──────────────────────────
 function normalizeTimeZone(value: string | null): string | null {
@@ -535,8 +563,8 @@ async function fetchDailyGroupedRows(
 ): Promise<GroupedRow[]> {
   // The two-class cross-device aggregation runs in Postgres
   // (account_usage_grouped), matching tokentracker-leaderboard-refresh.ts:
-  //   * ACCOUNT-LEVEL sources (cursor): ONE canonical whole row per
-  //     (bucket, source, model), across ALL devices (device-independent).
+  //   * ACCOUNT-LEVEL sources (cursor, trae-cn): ONE canonical whole row
+  //     per (bucket, source, model), across ALL devices (device-independent).
   //   * MACHINE-LEVEL sources: summed across the user's ACTIVE devices
   //     (revoked_at IS NULL), dropping historic device churn.
   // Day grain is enough — the modal only aggregates by day. The cached

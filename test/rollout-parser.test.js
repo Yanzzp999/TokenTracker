@@ -9479,6 +9479,72 @@ test("parsePiIncremental counts pure-reasoning rows (only reasoningTokens > 0)",
   }
 });
 
+// Dots is used as a pi backend, not a standalone session-log source — there is
+// no independent parseDotsIncremental. piSourceForProvider() slugifies any
+// provider string generically, so provider: "dots" already queues under
+// "pi-dots" with zero rollout.js changes; these tests only pin that behavior.
+test("parsePiIncremental routes provider 'dots' to the pi-dots source", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-pi-"));
+  try {
+    const sessionsDir = path.join(tmp, "sessions", "--test--");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const filePath = path.join(sessionsDir, "session.jsonl");
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const cursors = { version: 1, files: {}, updatedAt: null };
+
+    const ts = Date.UTC(2026, 3, 5, 14, 10, 0);
+    const lines = [
+      buildOmpSessionHeader(),
+      buildOmpAssistantLine({ id: "dots-1", provider: "dots", model: "dots-default", input: 100, output: 20, timestamp: ts, totalTokens: 120 }),
+    ];
+    await fs.writeFile(filePath, lines.join("\n") + "\n", "utf8");
+
+    const res = await parsePiIncremental({ sessionFiles: [filePath], cursors, queuePath });
+    assert.equal(res.eventsAggregated, 1);
+
+    const queued = await readJsonLines(queuePath);
+    assert.equal(queued.length, 1);
+    assert.equal(queued[0].source, "pi-dots");
+    assert.equal(queued[0].model, "dots-default");
+    assert.equal(queued[0].input_tokens, 100);
+    assert.equal(queued[0].output_tokens, 20);
+    assert.equal(queued[0].total_tokens, 120);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("parsePiIncremental does not double-count 'dots' provider rows on a second parse", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-pi-"));
+  try {
+    const sessionsDir = path.join(tmp, "sessions", "--test--");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const filePath = path.join(sessionsDir, "session.jsonl");
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const cursors = { version: 1, files: {}, updatedAt: null };
+
+    const ts = Date.UTC(2026, 3, 5, 14, 10, 0);
+    const lines = [
+      buildOmpSessionHeader(),
+      buildOmpAssistantLine({ id: "dots-1", provider: "dots", model: "dots-default", input: 100, output: 20, timestamp: ts, totalTokens: 120 }),
+    ];
+    await fs.writeFile(filePath, lines.join("\n") + "\n", "utf8");
+
+    const res1 = await parsePiIncremental({ sessionFiles: [filePath], cursors, queuePath });
+    assert.equal(res1.eventsAggregated, 1);
+
+    const res2 = await parsePiIncremental({ sessionFiles: [filePath], cursors, queuePath });
+    assert.equal(res2.eventsAggregated, 0);
+
+    const queued = await readJsonLines(queuePath);
+    assert.equal(queued.length, 1);
+    assert.equal(queued[0].source, "pi-dots");
+    assert.equal(queued[0].total_tokens, 120);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test("resolvePiSessionFiles returns empty when ~/.pi/agent/sessions missing", async () => {
   const result = resolvePiSessionFiles({ HOME: path.join(os.tmpdir(), "no-such-pi-home") });
   assert.deepEqual(result, []);

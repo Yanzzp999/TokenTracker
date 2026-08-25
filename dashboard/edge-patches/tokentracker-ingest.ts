@@ -105,7 +105,75 @@ export default async function (req: Request): Promise<Response> {
     : Array.isArray(body.hourly)
       ? body.hourly
       : [];
-  if (!Array.isArray(buckets) || buckets.length === 0) {
+
+  // Account session states (kind: "account_session_state" queue records)
+  // are canonical observations of one provider-side session (trae-cn):
+  // identity is (user, source, session_id) - device_id is NOT identity, so
+  // every device of the account converges onto the same row via the LWW
+  // upsert rpc. Downward / model / bucket corrections are one whole-row
+  // replace; absence never deletes (contract NOT PROVEN). A states-only
+  // batch is a meaningful upload and must not fall into the no-buckets
+  // reject.
+  const rawStates = Array.isArray(body.account_session_states) ? body.account_session_states : [];
+  if (rawStates.length > 500) {
+    return json({ error: "Too many account session states (max 500)" }, 400);
+  }
+  const TOKEN_KEYS = [
+    "input_tokens",
+    "output_tokens",
+    "cached_input_tokens",
+    "cache_creation_input_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+  ] as const;
+  const states: Record<string, unknown>[] = [];
+  for (const r of rawStates) {
+    const source = typeof r?.source === "string" ? r.source.trim().toLowerCase() : "";
+    const sessionId = typeof r?.session_id === "string" ? r.session_id.trim() : "";
+    const model = typeof r?.model === "string" ? r.model.trim() : "";
+    const bucketStart = Date.parse(String(r?.bucket_start ?? ""));
+    const verifiedAt = Date.parse(String(r?.snapshot_verified_at ?? ""));
+    const tokens: Record<string, number> = {};
+    let tokensOk = true;
+    for (const k of TOKEN_KEYS) {
+      const v = Number(r?.[k]);
+      if (!Number.isSafeInteger(v) || v < 0) tokensOk = false;
+      else tokens[k] = v;
+    }
+    // Fail closed on a malformed state record: a bogus canonical session row
+    // would corrupt the account's cross-device truth. The parser guarantees
+    // total = input + cached + cacheCreation + output; enforce it here too.
+    if (
+      source !== "trae-cn" ||
+      !sessionId ||
+      sessionId.length > 256 ||
+      !model ||
+      model.length > 200 ||
+      !Number.isFinite(bucketStart) ||
+      !Number.isFinite(verifiedAt) ||
+      !tokensOk ||
+      tokens.total_tokens !==
+        tokens.input_tokens + tokens.cached_input_tokens + tokens.cache_creation_input_tokens + tokens.output_tokens
+    ) {
+      return json({ error: "Invalid account session state" }, 400);
+    }
+    states.push({
+      source,
+      session_id: sessionId,
+      model,
+      bucket_start: new Date(bucketStart).toISOString(),
+      snapshot_verified_at: new Date(verifiedAt).toISOString(),
+      ...tokens,
+    });
+  }
+  // Same-session collisions inside one batch would make the LWW upsert's
+  // ON CONFLICT affect a row twice (Postgres error). Keep the LAST record:
+  // the append-only CLI queue writes later records with newer stamps.
+  const stateMap = new Map<string, Record<string, unknown>>();
+  for (const r of states) stateMap.set(r.source + "|" + r.session_id, r);
+  const stateRows = Array.from(stateMap.values());
+
+  if ((!Array.isArray(buckets) || buckets.length === 0) && stateRows.length === 0) {
     return json({ error: "No usage buckets provided" }, 400);
   }
   if (buckets.length > 500) {
@@ -156,6 +224,21 @@ export default async function (req: Request): Promise<Response> {
     });
 
   if (upsertErr) return json({ error: upsertErr.message }, 500);
+
+  if (stateRows.length > 0) {
+    // Write AFTER the bucket rows of the same upload landed, so canonical
+    // session state never advances for an upload whose device-level rows
+    // failed. The rpc applies a STRICTLY-newer LWW guard
+    // (EXCLUDED.snapshot_verified_at > stored): replays are idempotent and
+    // a transport retry of an older observation can never displace a newer
+    // one. Equal-stamp conflicts keep the first-applied row (stable under
+    // retries).
+    const { error: stateErr } = await client.database.rpc(
+      "tokentracker_upsert_account_session_states",
+      { p_user_id: userId, p_states: stateRows },
+    );
+    if (stateErr) return json({ error: stateErr.message }, 500);
+  }
 
   return json({ ok: true, inserted: rows.length, skipped: 0 });
 }

@@ -434,10 +434,10 @@ internal sealed class DashboardWindow : Window
         NavigateWhenServerReady("/?app=1");
     }
 
-    public void PushPetSettings(bool visible, string size, string character)
+    public void PushPetSettings(bool visible, string size, string character, string botColor)
     {
         if (!_coreReady) return;
-        var json = JsonSerializer.Serialize(new { visible, size, character });
+        var json = JsonSerializer.Serialize(new { visible, size, character, botColor });
         try
         {
             _ = _webView.CoreWebView2.ExecuteScriptAsync(

@@ -26,6 +26,11 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
     private var webView: WKWebView?
     private var loadingOverlay: NSView?
     private var loadingHostingController: NSHostingController<AnyView>?
+    /// A newly launched app may overlap the previous version briefly while the
+    /// updater relaunches it. Keep every WKWebView request queued until
+    /// ServerManager has replaced the listener on the fixed dashboard port.
+    private var dashboardNavigationAllowed = false
+    private var pendingDashboardURL: URL?
     /// Preserve the WebView's sessionStorage only while a native OAuth round trip
     /// needs its PKCE verifier. Normal dashboard closes release the browser runtime.
     private var oauthInFlight = false
@@ -44,6 +49,17 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
     }
 
     // MARK: - Public
+
+    /// Opens the process-lifetime navigation gate after local server startup has
+    /// settled. The window can be visible behind its loading overlay before this
+    /// point, but it must not receive HTML from the previous app version.
+    func allowDashboardNavigation() {
+        guard !dashboardNavigationAllowed else { return }
+        dashboardNavigationAllowed = true
+        guard let pendingDashboardURL else { return }
+        self.pendingDashboardURL = nil
+        loadDashboard(pendingDashboardURL)
+    }
 
     /// Window-only presentation. App-wide activation/Dock policy is owned by
     /// `DashboardPresentationCoordinator` so every open/close entry shares the
@@ -175,7 +191,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
         // Load dashboard
         retryCount = 0
         if let url = URL(string: Constants.serverBaseURL + "?app=1") {
-            webView.load(URLRequest(url: url))
+            loadDashboard(url)
         }
 
         // Show window after switching to regular app (shows dock icon).
@@ -186,6 +202,15 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
     func reload() {
         retryCount = 0
         webView?.reload()
+    }
+
+    private func loadDashboard(_ url: URL) {
+        guard dashboardNavigationAllowed else {
+            pendingDashboardURL = url
+            return
+        }
+        pendingDashboardURL = nil
+        webView?.load(URLRequest(url: url))
     }
 
     /// Match dashboard light/dark so native glass / `NSVisualEffectView` + window chrome follow the web theme.
@@ -380,6 +405,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
         closingWindow.contentView = nil
         loadingOverlay = nil
         loadingHostingController = nil
+        pendingDashboardURL = nil
         self.webView = nil
         self.window = nil
     }
@@ -451,7 +477,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
     func showSettings() {
         DashboardPresentationCoordinator.shared.showDashboard()
         if let url = URL(string: Constants.serverBaseURL + "/settings?app=1") {
-            webView?.load(URLRequest(url: url))
+            loadDashboard(url)
         }
     }
 
@@ -460,7 +486,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
         DashboardPresentationCoordinator.shared.showDashboard()
         // Reload dashboard so InsForge SDK picks up session from server-side cookie relay
         if let url = URL(string: Constants.serverBaseURL + "?app=1") {
-            webView?.load(URLRequest(url: url))
+            loadDashboard(url)
         }
     }
 
@@ -472,7 +498,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
         let encoded = code.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? code
         let callbackUrl = Constants.serverBaseURL + "/auth/callback?insforge_code=\(encoded)"
         if let url = URL(string: callbackUrl) {
-            webView?.load(URLRequest(url: url))
+            loadDashboard(url)
         }
     }
 
@@ -591,7 +617,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
         let delay = min(Double(retryCount) * 2, 10)
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, let url = URL(string: Constants.serverBaseURL + "?app=1") else { return }
-            self.webView?.load(URLRequest(url: url))
+            self.loadDashboard(url)
         }
     }
 }

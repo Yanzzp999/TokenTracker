@@ -89,6 +89,13 @@ const {
   resolveCopilotAppDbPaths,
   probeWslDistros,
 } = require("../lib/rollout");
+const {
+  TRAE_CN_USAGE_ENV,
+  isTraeCnUsageEnabled,
+  resolveTraeCnStoragePath,
+  readTraeCnAuthFromStorage,
+  extractTraeCnToken,
+} = require("../lib/trae-cn-config");
 const wsl = require("../lib/wsl-probe");
 const { getWslMode, isInvalidWslMode, shouldProbeWsl, discoverWslHome } = wsl;
 const { resolveInstallPaths, resolveZcodeNativeDbPath } = require("../lib/install-resolver");
@@ -642,6 +649,34 @@ async function cmdStatus(argv = []) {
     ? readTraeEntitlementFromStorage(traeStoragePath)
     : null;
 
+  // Trae SOLO CN — opt-in usage-API reader. Unlike the passive entitlement
+  // reader above, this source sends the locally stored sign-in JWT to TRAE's
+  // official API, so status surfaces the opt-in flag, the resolved storage
+  // path, and whether the auth blob decrypts — the three inputs a "why is my
+  // TRAE CN data missing" diagnosis needs.
+  // A resolvable default path does NOT mean the app is installed - the macOS
+  // resolver always derives one. Match the sync path semantics exactly:
+  // installed iff the storage file actually exists on disk.
+  const traeCnStoragePath = resolveTraeCnStoragePath({ env: process.env, home });
+  const traeCnInstalled = Boolean(
+    traeCnStoragePath && fssync.existsSync(traeCnStoragePath),
+  );
+  let traeCnAuthState = "not-signed-in";
+  if (traeCnInstalled) {
+    try {
+      const traeCnAuth = readTraeCnAuthFromStorage({ env: process.env, home, platform: process.platform });
+      if (traeCnAuth) {
+        extractTraeCnToken(traeCnAuth);
+        traeCnAuthState = "readable";
+      }
+    } catch (error) {
+      // Distinguish a real IO failure (unreadable) from present-but-bad
+      // data (malformed); neither ever carries storage contents.
+      traeCnAuthState = error?.code === "TRAE_CN_STORAGE_UNREADABLE" ? "unreadable" : "malformed";
+    }
+  }
+  const traeCnUsageOptIn = isTraeCnUsageEnabled(process.env);
+
   // Grok Build (xAI TUI)
   const grokHookState = await probeGrokHookState({ home, trackerDir, env: process.env });
   const grokSessions = grokHookState.hasGrokInstall || grokHookState.sessionsDir
@@ -933,6 +968,14 @@ async function cmdStatus(argv = []) {
               ...(traeEntitlement ? { entitlement: traeEntitlement } : {}),
             }
           : { installed: false },
+        "trae-cn": traeCnInstalled
+          ? {
+              installed: true,
+              detail: traeCnStoragePath,
+              auth: traeCnAuthState,
+              usage_opt_in: traeCnUsageOptIn,
+            }
+          : { installed: false },
         grok_build: grokInstalled
           ? {
               installed: true,
@@ -1104,6 +1147,13 @@ async function cmdStatus(argv = []) {
         : null,
       traeEntitlement
         ? `- Trae SOLO plan: ${formatTraeEntitlementLine(traeEntitlement)}`
+        : null,
+      traeCnInstalled
+        // Installed, signed in, and one env var away from usage data is the
+        // one actionable state on this line — mark it so it does not read
+        // like the ~30 neutral install lines around it (#492). Every other
+        // combination (opted in, or no readable auth to send) is neutral.
+        ? `- ${traeCnAuthState === "readable" && !traeCnUsageOptIn ? "⚠ " : ""}Trae SOLO CN: usage sync ${traeCnUsageOptIn ? "opted in" : `off (set ${TRAE_CN_USAGE_ENV}=1 to enable)`}, auth ${traeCnAuthState} (${traeCnStoragePath})`
         : null,
       ...(() => {
         if (!hermesInstalled) return [];

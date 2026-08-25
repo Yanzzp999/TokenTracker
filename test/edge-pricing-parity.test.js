@@ -40,6 +40,14 @@ function extractBlock(name) {
   return m[0];
 }
 
+const ROW_PRICING_RE = /\nfunction getRowPricing\([\s\S]*?\n\}/;
+
+function extractRowPricing(name) {
+  const m = readEdge(name).match(ROW_PRICING_RE);
+  assert.ok(m, `${name}: getRowPricing not found`);
+  return m[0];
+}
+
 test("MODEL_PRICING + getModelPricing are byte-identical across all 5 edge files", () => {
   const canonical = extractBlock(CANONICAL);
   for (const name of MIRRORS) {
@@ -104,7 +112,7 @@ test("all cloud cost paths keep Pi Copilot subscription rows at zero cost", () =
     if (name === "tokentracker-account-model-breakdown.ts") {
       assert.match(
         source,
-        /const cost = subscriptionBacked\s*\? 0/,
+        /ma\.totalCostUsd \+= subscriptionBacked\s*\? 0/,
         `${name}: subscription rows must bypass model pricing`,
       );
     } else {
@@ -128,4 +136,39 @@ test("all cloud cost paths prefer provider-reported costs when available", () =>
       `${name}: positive reported cost must win over model pricing`,
     );
   }
+});
+
+test("all cloud cost paths retain DeepSeek V4 peak/off-peak pricing tiers", () => {
+  for (const name of [CANONICAL, ...MIRRORS]) {
+    const source = readEdge(name);
+    assert.ok(source.includes('function getRowPricing('), `${name}: row pricing helper missing`);
+    assert.ok(source.includes('pricing_tier === "off_peak"'), `${name}: off-peak tier missing`);
+    assert.ok(source.includes('hour >= 1 && hour < 4'), `${name}: first peak window missing`);
+    assert.ok(source.includes('hour >= 6 && hour < 10'), `${name}: second peak window missing`);
+    assert.ok(
+      source.includes("Date.UTC(2026, 7, 22, 16, 0, 0)"),
+      `${name}: Beijing weekend off-peak rule missing`,
+    );
+    assert.ok(
+      source.includes("timestamp + 8 * 60 * 60 * 1000).getUTCDay()"),
+      `${name}: weekend must be read in Beijing time, not on the raw UTC instant`,
+    );
+  }
+  // getRowPricing carries the tier logic and is copied by hand like the pricing
+  // block above, so hold it to the same byte-identical rule. Substring checks
+  // alone let one file's window drift while every assertion still passes.
+  const canonicalRow = extractRowPricing(CANONICAL);
+  for (const name of MIRRORS) {
+    assert.strictEqual(
+      extractRowPricing(name),
+      canonicalRow,
+      `${name} getRowPricing drifted from ${CANONICAL} — copy the canonical function over verbatim`,
+    );
+  }
+  const breakdown = readEdge("tokentracker-account-model-breakdown.ts");
+  assert.match(
+    breakdown,
+    /ma\.totalCostUsd \+= subscriptionBacked/,
+    "model breakdown must price each pricing-tier row before collapsing models",
+  );
 });

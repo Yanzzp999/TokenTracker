@@ -155,6 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Task { @MainActor in
             await serverManager.ensureServerRunning()
+            DashboardWindowController.shared.allowDashboardNavigation()
             let serverHealthy = await APIClient.shared.checkServerHealth()
             let isOnline = serverManager.isServerRunning || serverHealthy
             if isOnline {

@@ -15683,10 +15683,61 @@ async function retractStaleGrokQueueRows(queuePath, keepKeys) {
   return lines.length;
 }
 
+function pruneMissingGrokProjectUpdateOffsets(projectUpdateOffsets) {
+  if (!projectUpdateOffsets || typeof projectUpdateOffsets !== "object") return;
+  for (const updatesPath of Object.keys(projectUpdateOffsets)) {
+    if (typeof updatesPath !== "string" || !updatesPath) {
+      delete projectUpdateOffsets[updatesPath];
+      continue;
+    }
+    try {
+      if (!fssync.existsSync(updatesPath)) delete projectUpdateOffsets[updatesPath];
+    } catch {
+      delete projectUpdateOffsets[updatesPath];
+    }
+  }
+}
+
+function grokTryDecodeUriComponent(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  try {
+    const decoded = decodeURIComponent(trimmed).trim();
+    return decoded || null;
+  } catch {
+    return null;
+  }
+}
+
+function grokEncodedCwdLooksEncoded(value) {
+  return typeof value === "string" && /%[0-9A-Fa-f]{2}/.test(value);
+}
+
+// First non-empty wins: summary.info.cwd, hook sess.cwd, decode(encodedCwd),
+// then decode(basename(dirname(sessionDir))). Do not guess from updates.jsonl.
+function resolveGrokSessionCwd(sess, summary) {
+  const summaryCwd = summary?.info?.cwd;
+  if (typeof summaryCwd === "string" && summaryCwd.trim()) return summaryCwd.trim();
+  if (typeof sess?.cwd === "string" && sess.cwd.trim()) return sess.cwd.trim();
+  if (grokEncodedCwdLooksEncoded(sess?.encodedCwd)) {
+    const decoded = grokTryDecodeUriComponent(sess.encodedCwd);
+    if (decoded) return decoded;
+  }
+  const sessionDir = typeof sess?.sessionDir === "string" ? sess.sessionDir.trim() : "";
+  if (sessionDir) {
+    const decoded = grokTryDecodeUriComponent(path.basename(path.dirname(sessionDir)));
+    if (decoded) return decoded;
+  }
+  return null;
+}
+
 async function parseGrokBuildIncremental({
   sessions,
   cursors = {},
   queuePath,
+  projectQueuePath,
+  publicRepoResolver,
   onProgress,
   env = process.env
 } = {}) {
@@ -15730,6 +15781,25 @@ async function parseGrokBuildIncremental({
     typeof grokState.updateOffsets === "object"
       ? grokState.updateOffsets
       : {};
+
+  const projectEnabled = typeof projectQueuePath === "string" && projectQueuePath.length > 0;
+  const projectState = projectEnabled ? normalizeProjectState(cursors?.projectHourly) : null;
+  const projectTouchedBuckets = projectEnabled ? new Set() : null;
+  const projectMetaCache = projectEnabled ? new Map() : null;
+  const publicRepoCache = projectEnabled ? new Map() : null;
+  // Independent of global updateOffsets so an upgrade can backfill historical
+  // turn_completed events into project.queue.jsonl without re-appending totals.
+  const projectUpdateOffsets =
+    projectEnabled &&
+    grokState.projectUpdateOffsets &&
+    typeof grokState.projectUpdateOffsets === "object"
+      ? { ...grokState.projectUpdateOffsets }
+      : {};
+  const projectSessionSnapshots = projectEnabled
+    ? normalizeGrokSessionSnapshots({
+        sessionSnapshots: grokState.projectSessionSnapshots,
+      })
+    : {};
 
   // Rebuilt from the sessions seen this scan, so entries for deleted session
   // dirs are pruned and the cursor stays bounded by the on-disk session count.
@@ -15908,10 +15978,166 @@ async function parseGrokBuildIncremental({
       };
     }
 
+    if (projectEnabled) {
+      const cwd = resolveGrokSessionCwd(sess, summary);
+      if (cwd) {
+        const projectContext = await resolveProjectContextForPath({
+          startDir: wsl.mapWslCwdToUnc(cwd, updatesPath || sess?.sessionDir || cwd),
+          projectMetaCache,
+          publicRepoCache,
+          publicRepoResolver,
+          projectState,
+        });
+        const projectRef = projectContext?.projectRef || null;
+        const projectKey = projectContext?.projectKey || null;
+        // Only advance the project cursor on successful public_verified attribution.
+        // Blocked / missing git / unverified stay unadvanced so a later sync can retry.
+        if (projectKey && projectRef) {
+          const projectPrevious = projectSessionSnapshots[sessionId] || {};
+          const projectPreviousTotal = normalizeNonNegativeNumber(projectPrevious.totalTokens);
+          const projectPreviousMessageCount = normalizeNonNegativeNumber(
+            projectPrevious.messageCount,
+          );
+          let projectSawTurnUsage = projectPrevious.source === "turn_usage";
+          let projectCumulativeTotal = projectPreviousTotal;
+          let projectTokenDelta = 0;
+          let projectFinalTouchedHourStart = null;
+          let projectSource = projectPrevious.source || null;
+          let projectLastModel = projectPrevious.model || model;
+          const projectPendingDeltas = [];
+
+          const projectUpdates = await readGrokUpdateTokenEvents(
+            updatesPath,
+            lastActive,
+            updatesPath ? projectUpdateOffsets[updatesPath] : null,
+            { fallbackModel: model },
+          );
+
+          for (const event of projectUpdates.turnEvents) {
+            projectSawTurnUsage = true;
+            const hourStartStr =
+              toUtcHalfHourStart(event.timestamp) ||
+              toUtcHalfHourStart(lastActive) ||
+              toUtcHalfHourStart(Date.now());
+            if (!hourStartStr) continue;
+            const eventModel = event.model || model;
+            const delta = {
+              input_tokens: event.input_tokens,
+              cached_input_tokens: event.cached_input_tokens,
+              cache_creation_input_tokens: event.cache_creation_input_tokens,
+              output_tokens: event.output_tokens,
+              reasoning_output_tokens: event.reasoning_output_tokens,
+              total_tokens: event.total_tokens,
+              billable_total_tokens: event.billable_total_tokens,
+              conversation_count: event.conversation_count || 1,
+            };
+            projectPendingDeltas.push({ model: eventModel, hourStartStr, delta });
+            projectCumulativeTotal += event.total_tokens;
+            projectTokenDelta += event.total_tokens;
+            projectFinalTouchedHourStart = hourStartStr;
+            projectSource = "turn_usage";
+            projectLastModel = eventModel;
+          }
+
+          // Watermark fallback uses the independent project snapshot, never
+          // global sessionSnapshots.totalTokens, and never stacks on turn usage.
+          if (!projectSawTurnUsage) {
+            let highWatermark = projectPreviousTotal;
+            for (const event of projectUpdates.contextEvents) {
+              if (event.totalTokens <= highWatermark) continue;
+              const deltaTokens = event.totalTokens - highWatermark;
+              highWatermark = event.totalTokens;
+              const hourStartStr =
+                toUtcHalfHourStart(event.timestamp) ||
+                toUtcHalfHourStart(lastActive) ||
+                toUtcHalfHourStart(Date.now());
+              if (!hourStartStr) continue;
+              const delta = estimateGrokTokenDelta(deltaTokens, 0, {
+                allowZeroConversationCount: true,
+              });
+              projectPendingDeltas.push({ model, hourStartStr, delta });
+              projectTokenDelta += deltaTokens;
+              projectFinalTouchedHourStart = hourStartStr;
+              projectSource = "updates";
+            }
+
+            const effectiveSignalTotal = grokEffectiveTotalFromSignals(safeSignals);
+            if (effectiveSignalTotal > highWatermark) {
+              const deltaTokens = effectiveSignalTotal - highWatermark;
+              highWatermark = effectiveSignalTotal;
+              const hourStartStr =
+                toUtcHalfHourStart(lastActive) || toUtcHalfHourStart(Date.now());
+              if (hourStartStr) {
+                const delta = estimateGrokTokenDelta(deltaTokens, 0, {
+                  allowZeroConversationCount: true,
+                });
+                projectPendingDeltas.push({ model, hourStartStr, delta });
+                projectTokenDelta += deltaTokens;
+                projectFinalTouchedHourStart = hourStartStr;
+                projectSource = "signals";
+              }
+            }
+            projectCumulativeTotal = Math.max(projectPreviousTotal, highWatermark);
+          }
+
+          const projectFinalTotal = Math.max(projectPreviousTotal, projectCumulativeTotal);
+
+          // legacyBaselineOnly applies only to global buckets.
+          for (const pending of projectPendingDeltas) {
+            const projectBucket = getProjectBucket(
+              projectState,
+              projectKey,
+              "grok",
+              pending.hourStartStr,
+              projectRef,
+            );
+            addTotals(projectBucket.totals, pending.delta);
+            projectTouchedBuckets.add(
+              projectBucketKey(projectKey, "grok", pending.hourStartStr),
+            );
+          }
+
+          if (!projectSawTurnUsage && projectTokenDelta > 0 && projectFinalTouchedHourStart) {
+            const deltaMessageCount =
+              messageCount > projectPreviousMessageCount
+                ? messageCount - projectPreviousMessageCount
+                : 1;
+            const projectBucket = getProjectBucket(
+              projectState,
+              projectKey,
+              "grok",
+              projectFinalTouchedHourStart,
+              projectRef,
+            );
+            addTotals(projectBucket.totals, { conversation_count: deltaMessageCount });
+            projectTouchedBuckets.add(
+              projectBucketKey(projectKey, "grok", projectFinalTouchedHourStart),
+            );
+          }
+
+          if (updatesPath && projectUpdates.offsetEntry) {
+            projectUpdateOffsets[updatesPath] = projectUpdates.offsetEntry;
+          }
+
+          if (projectFinalTotal > 0 && (projectTokenDelta > 0 || projectPreviousTotal > 0)) {
+            projectSessionSnapshots[sessionId] = {
+              totalTokens: projectFinalTotal,
+              messageCount: Math.max(projectPreviousMessageCount, messageCount),
+              model: projectLastModel || model,
+              source: projectSource || projectPrevious.source || null,
+              updatedAt: new Date().toISOString(),
+            };
+          }
+        }
+      }
+    }
+
     if (onProgress) {
       onProgress({ index: index + 1, total: sessionList.length, bucketsQueued: touchedBuckets.size });
     }
   }
+
+  if (projectEnabled) pruneMissingGrokProjectUpdateOffsets(projectUpdateOffsets);
 
   let bucketsQueued = queuePath
     ? await enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets })
@@ -15930,8 +16156,20 @@ async function parseGrokBuildIncremental({
     bucketsQueued += retracted;
   }
 
+  const projectBucketsQueued = projectEnabled
+    ? await enqueueTouchedProjectBuckets({
+        projectQueuePath,
+        projectState,
+        projectTouchedBuckets,
+      })
+    : 0;
+
   hourlyState.updatedAt = new Date().toISOString();
   cursors.hourly = hourlyState;
+  if (projectState) {
+    projectState.updatedAt = hourlyState.updatedAt;
+    cursors.projectHourly = projectState;
+  }
   sessionSnapshots = capGrokSessionSnapshots(sessionSnapshots);
 
   const migrations = grokState.migrations && typeof grokState.migrations === "object"
@@ -15951,6 +16189,12 @@ async function parseGrokBuildIncremental({
     sessionSnapshots,
     seenSessions: Object.keys(sessionSnapshots),
     updateOffsets,
+    ...(projectEnabled
+      ? {
+          projectUpdateOffsets,
+          projectSessionSnapshots: capGrokSessionSnapshots(projectSessionSnapshots),
+        }
+      : {}),
     migrations,
     updatedAt: new Date().toISOString()
   };
@@ -15958,7 +16202,8 @@ async function parseGrokBuildIncremental({
   return {
     recordsProcessed: eventsAggregated,
     eventsAggregated,
-    bucketsQueued
+    bucketsQueued,
+    projectBucketsQueued,
   };
 }
 
@@ -16496,6 +16741,489 @@ function readTraeEntitlementFromStorage(storagePath) {
     ...entitlement,
     captured_at: stat ? new Date(stat.mtimeMs).toISOString() : null,
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trae Work CN (国内版) — usage API incremental parser.
+//
+// TRAE Work CN's usage API reports per-session rows that are NOT append-only:
+// a session can be re-reported with corrected token totals, a different model,
+// or a shifted time bucket. This parser keeps the last normalized contribution
+// per session_id under `cursors.traeCn` and reconciles by subtracting the
+// previous contribution from its old bucket before adding the new one, so
+// corrections retract the stale tuple instead of stacking. Only the normalized
+// contribution is persisted — no raw API rows, cost/credits, auth, refresh
+// tokens, or prompt previews. Source is always `trae-cn`.
+const TRAE_CN_SOURCE = "trae-cn";
+const TRAE_CN_STATE_VERSION = 1;
+const TRAE_CN_UNKNOWN_MODEL = "trae-cn-unknown";
+
+function normalizeTraeCnState(raw) {
+  if (raw === undefined || raw === null) {
+    return {
+      version: TRAE_CN_STATE_VERSION,
+      sessions: {},
+      prunedBeforeMs: 0,
+      updatedAt: null,
+    };
+  }
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("Trae CN cursor state is malformed.");
+  }
+  if (raw.version !== TRAE_CN_STATE_VERSION) {
+    throw new Error(`Trae CN cursor state version ${raw.version} is not supported.`);
+  }
+  if (!raw.sessions || typeof raw.sessions !== "object" || Array.isArray(raw.sessions)) {
+    throw new Error("Trae CN cursor sessions are malformed.");
+  }
+  return {
+    version: TRAE_CN_STATE_VERSION,
+    sessions: { ...raw.sessions },
+    prunedBeforeMs:
+      Number.isFinite(raw.prunedBeforeMs) && raw.prunedBeforeMs > 0 ? raw.prunedBeforeMs : 0,
+    updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : null,
+  };
+}
+
+function isValidTraeCnTotals(totals) {
+  if (!totals || typeof totals !== "object") return false;
+  for (const key of [
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_creation_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+    "billable_total_tokens",
+    "conversation_count",
+  ]) {
+    if (!Number.isSafeInteger(totals[key]) || totals[key] < 0) return false;
+  }
+  return true;
+}
+
+// Canonical UTC half-hour bucketStart produced by toUtcHalfHourStart:
+// "YYYY-MM-DDTHH:00:00.000Z" or "YYYY-MM-DDTHH:30:00.000Z".
+function isValidTraeCnBucketStart(value) {
+  if (typeof value !== "string") return false;
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:(00|30):00\.000Z$/.test(value)) return false;
+  const dt = new Date(value);
+  return Number.isFinite(dt.getTime()) && dt.toISOString() === value;
+}
+
+// Validate a stored prior contribution before it is ever subtracted, so a
+// tampered or corrupt cursor fails closed instead of silently rewinding buckets.
+// Enforces this provider's fixed canonical invariant (all totals safe
+// nonnegative integers, reasoning=0, conversation_count=1,
+// total=input+cached+cacheCreation+output, billable=total) plus a canonical
+// half-hour UTC bucketStart.
+function validateTraeCnStoredContribution(entry) {
+  if (!entry || typeof entry !== "object") {
+    throw new Error("Trae CN stored session contribution is malformed.");
+  }
+  if (
+    typeof entry.model !== "string" ||
+    !entry.model.trim() ||
+    entry.model.includes("|")
+  ) {
+    throw new Error("Trae CN stored session model is malformed.");
+  }
+  if (!isValidTraeCnBucketStart(entry.bucketStart)) {
+    throw new Error("Trae CN stored session bucket is malformed.");
+  }
+  if (!isValidTraeCnTotals(entry.totals)) {
+    throw new Error("Trae CN stored session totals are malformed.");
+  }
+  const { totals } = entry;
+  if (totals.reasoning_output_tokens !== 0 || totals.conversation_count !== 1) {
+    throw new Error("Trae CN stored session totals are malformed.");
+  }
+  const sum =
+    totals.input_tokens +
+    totals.cached_input_tokens +
+    totals.cache_creation_input_tokens +
+    totals.output_tokens;
+  if (totals.total_tokens !== sum || totals.billable_total_tokens !== totals.total_tokens) {
+    throw new Error("Trae CN stored session totals are malformed.");
+  }
+}
+
+// Token fields may live in `row.extra_info` (object or JSON string) or at the
+// top level of the row. Missing values are NOT coerced to zero.
+function traeCnExtraInfo(row) {
+  const extra = row?.extra_info;
+  if (extra && typeof extra === "object" && !Array.isArray(extra)) return extra;
+  if (typeof extra === "string") {
+    try {
+      const parsed = JSON.parse(extra);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch (_e) {}
+  }
+  return null;
+}
+
+function traeCnTokenField(row, extra, key) {
+  if (extra && extra[key] !== undefined && extra[key] !== null) return extra[key];
+  if (row && row[key] !== undefined && row[key] !== null) return row[key];
+  return undefined;
+}
+
+// Normalize one raw session row into the canonical contribution, or throw
+// before any cursor/bucket mutation happens. Returns
+// { sessionId, model, bucketStart, totals }.
+function normalizeTraeCnSession(row) {
+  const sessionId = typeof row?.session_id === "string" ? row.session_id.trim() : "";
+  if (!sessionId) {
+    throw new Error("Trae CN session row is missing session_id.");
+  }
+  let model;
+  if (row?.model_name === undefined || row?.model_name === null) {
+    model = TRAE_CN_UNKNOWN_MODEL;
+  } else if (typeof row.model_name === "string") {
+    model = row.model_name.trim() || TRAE_CN_UNKNOWN_MODEL;
+  } else {
+    throw new Error("Trae CN session row has an invalid model_name.");
+  }
+  if (model.includes("|")) {
+    throw new Error("Trae CN session row has an unsupported model name.");
+  }
+  if (!Number.isSafeInteger(row?.usage_time) || row.usage_time <= 0) {
+    throw new Error("Trae CN session row has an invalid usage_time.");
+  }
+  const bucketStart = toUtcHalfHourStart(row.usage_time * 1000);
+  if (!bucketStart) {
+    throw new Error("Trae CN session row has an invalid usage_time.");
+  }
+  const extra = traeCnExtraInfo(row);
+  // Cache fields may be absent for models without a prompt-cache concept
+  // (Doubao / DeepSeek on TRAE CN) — an absent cache field means "no cache
+  // activity", i.e. 0, NOT a malformed row. input/output stay mandatory.
+  //
+  // `input_token` is cache-INCLUSIVE: verifying real rows against TRAE CN's
+  // own credit billing, credits = fresh_input*p + cache_read*(p/4) + output*q
+  // fits every row with zero residual only under this reading (same
+  // convention as Codex / Qoder). Peel the cache subsets off into their own
+  // columns and report only the remainder as ordinary input, otherwise cached
+  // context is double-counted in dashboards and cost calculations. cache_write
+  // was 0 across all observed rows; it is treated as a further subset of the
+  // cache-inclusive input (clamped so the buckets always sum back to it).
+  const cacheRead = traeCnTokenField(row, extra, "cache_read_token");
+  const cacheWrite = traeCnTokenField(row, extra, "cache_write_token");
+  const fields = [
+    ["input_token", traeCnTokenField(row, extra, "input_token")],
+    ["output_token", traeCnTokenField(row, extra, "output_token")],
+    ["cache_read_token", cacheRead === undefined || cacheRead === null ? 0 : cacheRead],
+    ["cache_write_token", cacheWrite === undefined || cacheWrite === null ? 0 : cacheWrite],
+  ];
+  for (const [label, value] of fields) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`Trae CN session row has an invalid ${label}.`);
+    }
+  }
+  const rawInput = fields[0][1];
+  const outputTokens = fields[1][1];
+  const cachedInput = Math.min(rawInput, fields[2][1]);
+  const cacheCreation = Math.min(rawInput - cachedInput, fields[3][1]);
+  const total = rawInput + outputTokens;
+  if (!Number.isSafeInteger(total)) {
+    throw new Error("Trae CN session row token totals overflow.");
+  }
+  return {
+    sessionId,
+    model,
+    bucketStart,
+    totals: {
+      input_tokens: rawInput - cachedInput - cacheCreation,
+      output_tokens: outputTokens,
+      cached_input_tokens: cachedInput,
+      cache_creation_input_tokens: cacheCreation,
+      reasoning_output_tokens: 0,
+      total_tokens: total,
+      billable_total_tokens: total,
+      conversation_count: 1,
+    },
+  };
+}
+
+// Fail closed instead of letting subtractTotals clamp a stored prior
+// contribution that exceeds its source bucket (a corruption signal).
+function assertTraeCnBucketCovers(bucketTotals, previousTotals) {
+  for (const key of [
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_creation_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+    "billable_total_tokens",
+    "conversation_count",
+  ]) {
+    if ((bucketTotals[key] || 0) < (previousTotals[key] || 0)) {
+      throw new Error("Trae CN state corruption: stored contribution exceeds its bucket totals.");
+    }
+  }
+}
+
+// Account session state: a queue record (kind: "account_session_state")
+// carrying the CANONICAL observation of ONE provider-side TRAE CN session.
+// Cloud truth for trae-cn lives at the session level
+// (tokentracker_account_session_states; ingest edge upserts via
+// tokentracker_upsert_account_session_states): identity is
+// (user_id, source, session_id) - device_id is NOT identity (the usage API
+// request carries no device discriminator). Evidence split (2026-08-17, one
+// account, three real fetches 137 -> 141 -> 164): repeated-fetch id
+// stability VERIFIED (137/137 persisted, corrections KEPT ids), cross-window
+// stability VERIFIED (exact subsets), no duplicate ids OBSERVED. Cross-device
+// same-account id stability is NOT DIRECTLY VERIFIED - no device
+// discriminator in the request body is necessary but not sufficient (a
+// device/login context could ride inside the JWT / server auth context), and
+// no second independent device/auth experiment was run.
+//
+// The three correction classes collapse into ONE whole-row replace:
+//   downward  S tokens 100 -> 60
+//   model     S model A -> B
+//   bucket    S bucket 10:00 -> 10:30
+// A fresh device with no cursor history uploads every session it observes;
+// the cloud LWW guard reconciles versions. ABSENCE is NOT PROVEN to mean
+// deletion, so nothing is ever emitted for sessions missing from a
+// non-empty snapshot, and an empty payload emits nothing at all.
+//
+// snapshot_verified_at is the CLIENT logical fetch stamp (the API exposes no
+// provider-side ordering signal - headers carry only CDN trace ids, rows
+// carry no revision). It is stamped once per real fetch and replayed
+// verbatim by this append-only queue; the cloud upsert applies strictly
+// newer (>) stamps only, so replays are idempotent and a transport retry of
+// an older observation cannot displace a newer one. Cross-device ordering
+// under clock skew is a documented residual risk, NOT strict correctness.
+//
+// Appended AFTER the bucket rows of the same sync (queue order guarantees a
+// device's rows land before the states describing them). Bucket-row readers
+// skip this record via its kind field (it carries no hour_start and is not
+// a usage row).
+async function appendTraeCnSessionStates({ queuePath, observations, verifiedAtMs }) {
+  if (!Array.isArray(observations) || observations.length === 0) return 0;
+  if (!Number.isFinite(verifiedAtMs)) {
+    throw new Error("Trae CN session states require a finite verification stamp.");
+  }
+  const verifiedAt = new Date(verifiedAtMs).toISOString();
+  const lines = [];
+  for (const obs of observations) {
+    const t = obs.totals;
+    lines.push(
+      JSON.stringify({
+        kind: "account_session_state",
+        source: TRAE_CN_SOURCE,
+        session_id: obs.sessionId,
+        model: obs.model,
+        bucket_start: obs.bucketStart,
+        input_tokens: t.input_tokens,
+        output_tokens: t.output_tokens,
+        cached_input_tokens: t.cached_input_tokens,
+        cache_creation_input_tokens: t.cache_creation_input_tokens,
+        reasoning_output_tokens: t.reasoning_output_tokens,
+        total_tokens: t.total_tokens,
+        snapshot_verified_at: verifiedAt,
+      }),
+    );
+  }
+  await fs.appendFile(queuePath, lines.join("\n") + "\n", "utf8");
+  return lines.length;
+}
+
+async function parseTraeCnApiIncremental({
+  sessions,
+  cursors,
+  queuePath,
+  onProgress,
+  windowStartMs,
+  windowEndMs,
+  snapshotVerifiedAtMs,
+} = {}) {
+  if (!Array.isArray(sessions)) {
+    throw new Error("Trae CN sessions must be an array.");
+  }
+  if (!cursors || typeof cursors !== "object" || Array.isArray(cursors)) {
+    throw new Error("Trae CN cursors must be a writable object.");
+  }
+  await ensureDir(path.dirname(queuePath));
+
+  // Validate persisted state up front (fresh absent state initializes version
+  // 1; malformed state / unexpected version fails closed instead of resetting).
+  // Deep-clone the normalized working states so reconciliation and enqueue
+  // mutations never touch `cursors` before the final assignment succeeds.
+  const hourlyState = structuredClone(normalizeHourlyState(cursors?.hourly));
+  const traeCnState = structuredClone(normalizeTraeCnState(cursors?.traeCn));
+
+  if (sessions.length === 0) {
+    // Empty payload is a successful no-op: no usage mutation, no session
+    // state records.
+    //
+    // Evidence check (2026-08-16, two real fetches 17min apart over the same
+    // account: 137 -> 141 sessions, 0 disappeared, 0 rows changed) shows the
+    // session set is stable, but NOTHING proves 'absent from the response'
+    // means 'authoritatively deleted / zero' — so the absence contract is
+    // NOT PROVEN and must stay symmetric everywhere: a session missing from
+    // a non-empty snapshot never emits a retraction, and an empty response
+    // asserts nothing at all. Canonical corrections ride on explicit
+    // observations only.
+    return { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+  }
+
+  // Full prevalidation + in-payload dedupe BEFORE any cursor/bucket mutation.
+  //
+  // ANY malformed row fails the whole snapshot closed. Canonical session
+  // states assert this device actually understood the snapshot, so a
+  // partially understood snapshot (99 valid + 1 uninterpretable row) must
+  // never be enqueued: it would become the canonical cloud state. The
+  // provider-level try/catch in cmdSync keeps the failure
+  // isolated (other providers sync on) and the error message carries only
+  // the count + reason - no session ids, tokens, or credentials. Confirmed
+  // LEGAL variations must not land here: absent cache fields are already
+  // coerced to 0 inside normalizeTraeCnSession (models without a prompt
+  // cache concept); only truly uninterpretable rows (bad session_id /
+  // usage_time / token numbers / model, impossible schema) throw.
+  const bySession = new Map();
+  let skippedRows = 0;
+  let firstSkipReason = "";
+  for (const row of sessions) {
+    let normalized;
+    try {
+      normalized = normalizeTraeCnSession(row);
+    } catch (error) {
+      skippedRows += 1;
+      if (!firstSkipReason) firstSkipReason = error?.message || "unknown";
+      continue;
+    }
+    const existing = bySession.get(normalized.sessionId);
+    if (existing) {
+      const identical =
+        existing.model === normalized.model &&
+        existing.bucketStart === normalized.bucketStart &&
+        totalsKey(existing.totals) === totalsKey(normalized.totals);
+      if (!identical) {
+        throw new Error("Trae CN session rows contain conflicting contributions.");
+      }
+      continue; // exact duplicate within one payload is accepted once
+    }
+    bySession.set(normalized.sessionId, normalized);
+  }
+  if (skippedRows > 0) {
+    // Partial snapshots are not authoritative: one uninterpretable row means
+    // the window was NOT fully verified, so fail closed - no bucket rows, no
+    // session states, no cursor commit. The next sync replays from the same
+    // cursor state (idempotent).
+    throw new Error(
+      `Trae CN snapshot is not authoritative: ${skippedRows} malformed row${skippedRows !== 1 ? "s" : ""} (first: ${firstSkipReason}).`,
+    );
+  }
+  const touchedBuckets = new Set();
+  const cb = typeof onProgress === "function" ? onProgress : null;
+  const total = sessions.length;
+  let index = 0;
+  let eventsAggregated = 0;
+
+  // Validate EVERY existing stored contribution up front — not just sessions
+  // present in the incoming payload — so an unrelated malformed entry fails
+  // closed before any reconciliation mutation.
+  for (const sessionId of Object.keys(traeCnState.sessions)) {
+    validateTraeCnStoredContribution(traeCnState.sessions[sessionId]);
+  }
+
+  // Monotonic prune (same watermark pattern as the kiroCli cap above): the
+  // sync caller fetches a fixed trailing window, so a session whose entire
+  // half-hour bucket sits before windowStartMs can never reappear in a later
+  // payload — its stored contribution is dead reconciliation weight. Prune
+  // only when the window start moved FORWARD past the persisted watermark:
+  // an entry evicted under window W1 and re-fetched under an earlier window
+  // would find previousEntry undefined and count twice. The +30min margin
+  // matches bucketStart's half-hour floor, which can trail the row's
+  // usage_time by up to 30 minutes.
+  if (Number.isFinite(windowStartMs) && windowStartMs > traeCnState.prunedBeforeMs) {
+    const pruneCutoffMs = windowStartMs - 30 * 60 * 1000;
+    for (const sessionId of Object.keys(traeCnState.sessions)) {
+      const bucketMs = Date.parse(traeCnState.sessions[sessionId].bucketStart);
+      if (Number.isFinite(bucketMs) && bucketMs <= pruneCutoffMs) {
+        delete traeCnState.sessions[sessionId];
+      }
+    }
+    traeCnState.prunedBeforeMs = windowStartMs;
+  }
+
+  // Deterministic: process unique session ids in sorted order. Sessions
+  // whose canonical observation changed (or that were never seen) are also
+  // collected for the account_session_state queue records.
+  const sessionIds = [...bySession.keys()].sort();
+  const changedObservations = [];
+  for (const sessionId of sessionIds) {
+    const current = bySession.get(sessionId);
+    const previousEntry = traeCnState.sessions[sessionId];
+
+    const unchanged =
+      previousEntry &&
+      totalsKey(previousEntry.totals) === totalsKey(current.totals) &&
+      previousEntry.bucketStart === current.bucketStart &&
+      previousEntry.model === current.model;
+    if (unchanged) {
+      index += 1;
+      if (cb) cb({ index, total, eventsAggregated, bucketsQueued: touchedBuckets.size });
+      continue;
+    }
+
+    if (previousEntry) {
+      const oldBucket = getHourlyBucket(
+        hourlyState,
+        TRAE_CN_SOURCE,
+        previousEntry.model,
+        previousEntry.bucketStart,
+      );
+      assertTraeCnBucketCovers(oldBucket.totals, previousEntry.totals);
+      subtractTotals(oldBucket.totals, previousEntry.totals);
+      touchedBuckets.add(bucketKey(TRAE_CN_SOURCE, previousEntry.model, previousEntry.bucketStart));
+    }
+
+    const bucket = getHourlyBucket(hourlyState, TRAE_CN_SOURCE, current.model, current.bucketStart);
+    addTotals(bucket.totals, current.totals);
+    touchedBuckets.add(bucketKey(TRAE_CN_SOURCE, current.model, current.bucketStart));
+
+    traeCnState.sessions[sessionId] = {
+      model: current.model,
+      bucketStart: current.bucketStart,
+      totals: { ...current.totals },
+      updatedAt: new Date().toISOString(),
+    };
+    changedObservations.push({
+      sessionId,
+      model: current.model,
+      bucketStart: current.bucketStart,
+      totals: current.totals,
+    });
+    eventsAggregated += 1;
+    index += 1;
+    if (cb) cb({ index, total, eventsAggregated, bucketsQueued: touchedBuckets.size });
+  }
+
+  const bucketsQueued = await enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets });
+  // Emit canonical session observations only after the reconciled bucket
+  // rows are durably queued; a failure here aborts before cursor commit, so
+  // the next sync replays the (idempotent) reconciliation and re-appends
+  // both. snapshot_verified_at is stamped once per real fetch; the
+  // append-only queue replays it verbatim, so transport retries never fake
+  // freshness. Unchanged sessions emit nothing - a fixed-now no-change sync
+  // stays byte-identical.
+  const verifiedAtMs = Number.isFinite(snapshotVerifiedAtMs) ? snapshotVerifiedAtMs : Date.now();
+  await appendTraeCnSessionStates({
+    queuePath,
+    observations: changedObservations,
+    verifiedAtMs,
+  });
+  const updatedAt = new Date().toISOString();
+  hourlyState.updatedAt = updatedAt;
+  traeCnState.updatedAt = updatedAt;
+  // Assign cursor state only after enqueue succeeds.
+  cursors.hourly = hourlyState;
+  cursors.traeCn = traeCnState;
+
+  return { recordsProcessed: total, eventsAggregated, bucketsQueued, skippedRows };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -17351,6 +18079,7 @@ module.exports = {
   resolveTraePath,
   resolveTraeStoragePath,
   readTraeEntitlementFromStorage,
+  parseTraeCnApiIncremental,
   // DeepSeek Harness (dsh) — passive session-log reader
   resolveDshHome,
   resolveDshHomes,

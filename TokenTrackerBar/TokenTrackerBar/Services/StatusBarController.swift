@@ -825,6 +825,15 @@ final class StatusBarController: NSObject {
         }
 
         guard let anchorView = positionPopoverAnchorWindow(under: button) else { return }
+        // The window's Space assignment happens inside popover.show(). The
+        // reused _NSPopoverWindow keeps the desktop it was first ordered in on,
+        // and on macOS 26 the post-show insert below is applied too late — the
+        // popover then renders only on that one desktop (#506). Mark the reused
+        // window for all Spaces *before* showing so the assignment made during
+        // show already sees .canJoinAllSpaces.
+        if let reusedWindow = popover.contentViewController?.view.window {
+            reusedWindow.collectionBehavior.insert([.canJoinAllSpaces, .fullScreenAuxiliary])
+        }
         popover.show(relativeTo: anchorView.bounds, of: anchorView, preferredEdge: .minY)
         popoverShownAt = ProcessInfo.processInfo.systemUptime
         viewModel.setPopoverVisible(true)
@@ -864,22 +873,27 @@ final class StatusBarController: NSObject {
             if #available(macOS 26, *) {
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.popover.isShown else { return }
-                    let anchorAdmitted = self.popoverAnchorWindow?.isOnActiveSpace ?? true
-                    if anchorAdmitted {
+                    // Check the popover window itself, not the anchor: the anchor
+                    // is .canJoinAllSpaces, so it reports admitted on every regular
+                    // Space even when the popover window stayed pinned to another
+                    // desktop (#506).
+                    let popoverAdmitted = self.popover.contentViewController?.view.window?.isOnActiveSpace ?? true
+                    if popoverAdmitted {
                         guard self.canActivateForPopoverGlass() else { return }
                         NSApp.activate(ignoringOtherApps: true)
                         DispatchQueue.main.async { [weak self] in
                             self?.realignPopoverWithAnchorIfDisplaced()
                         }
                     } else {
-                        // The active Space is another app's full-screen Space, which
-                        // admits no window of an inactive app — the popover is shown
-                        // but never rendered. Activation is the only way in; if it
-                        // knocks the transient popover down (another window stole
-                        // key), re-show it once at the same anchor.
+                        // The popover is shown but not admitted onto the active
+                        // Space — either that Space is another app's full-screen
+                        // Space (admits no window of an inactive app), or the
+                        // reused popover window stayed pinned to the desktop it
+                        // was first ordered in on (#506). Activation is the only
+                        // way in; then re-show it once at the same anchor.
                         NSApp.activate(ignoringOtherApps: true)
                         DispatchQueue.main.async { [weak self] in
-                            self?.reshowPopoverAfterFullScreenActivation()
+                            self?.reshowPopoverOnActiveSpace()
                         }
                     }
                 }
@@ -896,12 +910,26 @@ final class StatusBarController: NSObject {
         Task { await viewModel.refreshForPopoverOpen() }
     }
 
-    // After activating to get admitted onto a full-screen Space, the transient
+    // After activating to get admitted onto the active Space, the transient
     // popover may have been dismissed (another app window grabbed key during
-    // activation). Re-open it once at the same anchor now that the app is active;
-    // if it survived, just realign it.
-    private func reshowPopoverAfterFullScreenActivation() {
+    // activation). Re-open it once at the same anchor now that the app is active.
+    // If it survived but is still stranded on another desktop (#506), close it
+    // first — the fresh show lands on the now-active Space. If it survived on
+    // the right Space, just realign it.
+    private func reshowPopoverOnActiveSpace() {
         if popover.isShown {
+            if popover.contentViewController?.view.window?.isOnActiveSpace == false {
+                guard !popoverReshowAttempted else { return }
+                popoverReshowAttempted = true
+                closePopoverIfShown()
+                // Re-show on the next tick, not inline: the reused
+                // _NSPopoverWindow has to actually order out before a fresh
+                // show can pick up the active Space, and `popover.isShown` is
+                // still settling — an inline toggle would be swallowed by the
+                // double-click guard and leave nothing on screen.
+                DispatchQueue.main.async { [weak self] in self?.togglePopover() }
+                return
+            }
             realignPopoverWithAnchorIfDisplaced()
             return
         }
@@ -1334,6 +1362,7 @@ final class StatusBarController: NSObject {
     private func iconStyleLabel(_ style: MenuBarIconStyle) -> String {
         switch style {
         case .clawd: return Strings.petCharacterClawd
+        case .bot: return Strings.petCharacterBot
         case .cat: return Strings.iconStyleCat
         case .pet: return Strings.iconStyleMyPet
         case .static: return Strings.iconStyleStatic

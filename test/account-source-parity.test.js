@@ -5,12 +5,18 @@
 // devices) is hardcoded in several places that MUST agree:
 //   - src/lib/source-metadata.js               (authoritative, used by the CLI)
 //   - scripts/ops/account-usage-grouped-rpc.sql (account view RPC)
-//   - scripts/ops/leaderboard-usage-grouped-rpc.sql (leaderboard RPC)
 //   - dashboard/edge-patches/tokentracker-leaderboard-profile.ts (profile edge)
 //   - dashboard/edge-patches/tokentracker-account-devices.ts (device breakdown edge)
 // A drift (e.g. adding a new account-level source to source-metadata.js but
 // forgetting the SQL) silently re-introduces the cross-device double-count bug
 // that v0.44 fixed. This test fails loudly on any mismatch.
+//
+// NOT covered here: scripts/ops/leaderboard-usage-grouped-rpc.sql (SUPERSEDED
+// rollback reference — do not edit or verify). Since the account
+// session-states work, leaderboard_hourly_dedup_v2's account_sources array
+// IS versioned in migrations/20260817120000_account-session-states.sql, so
+// it is verified below; applying that migration to production stays a
+// maintainer-side deployment step.
 
 const fs = require("node:fs");
 const path = require("node:path");
@@ -46,7 +52,7 @@ function extractSqlAccountSources(content) {
     .sort();
 }
 
-test("account-level source list is identical across source-metadata, both RPCs, and the profile edge", () => {
+test("account-level source list is identical across source-metadata, the account RPC, and the profile edge", () => {
   const authoritative = extractJsSet(
     readFile("src/lib/source-metadata.js"),
     "ACCOUNT_LEVEL_SOURCES",
@@ -60,8 +66,8 @@ test("account-level source list is identical across source-metadata, both RPCs, 
     "account-usage-grouped-rpc.sql": extractSqlAccountSources(
       readFile("scripts/ops/account-usage-grouped-rpc.sql"),
     ),
-    "leaderboard-usage-grouped-rpc.sql": extractSqlAccountSources(
-      readFile("scripts/ops/leaderboard-usage-grouped-rpc.sql"),
+    "20260817120000_account-session-states.sql (leaderboard_hourly_dedup_v2)": extractSqlAccountSources(
+      readFile("migrations/20260817120000_account-session-states.sql"),
     ),
     "tokentracker-leaderboard-profile.ts": extractJsSet(
       readFile("dashboard/edge-patches/tokentracker-leaderboard-profile.ts"),

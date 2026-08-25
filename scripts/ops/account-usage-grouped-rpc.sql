@@ -25,12 +25,26 @@
 --     is immune to that. The cost: two genuinely distinct machines running the
 --     SAME model in the SAME half-hour count once, not summed — rare, and far
 --     better than the systemic ~2x that fold-then-SUM produced.
---   * ACCOUNT-LEVEL sources (cursor) come from a per-ACCOUNT cloud API, NOT
---     machine logs. Every device that syncs them stores an IDENTICAL copy, so
---     SUMming across devices multiplies one account's usage by its device
---     count (the v0.42.0 bug: a 2-machine user's Cursor total was double). For
---     these, pick ONE canonical row per (hour, source, model) across ALL the
---     user's devices — dedup, do not add.
+--   * ACCOUNT-LEVEL sources (cursor, trae-cn) come from a per-ACCOUNT cloud
+--     API, NOT machine logs, so SUMming across devices multiplies one
+--     account's usage by its device count (the v0.42.0 double-count bug).
+--     Dedup, do not add. HOW to dedup depends on the source's identity:
+--       - cursor rows are identical across devices (no session identity):
+--         the legacy whole-row per-(hour, model) MAX pick below.
+--       - trae-cn is a CORRECTABLE snapshot: totals can be revised down, a
+--         session can move to another model or another half-hour. Hour-level
+--         dedup cannot express that (a fresh device's first data bucket
+--         cannot safely displace earlier hours), so trae-cn aggregates from
+--         tokentracker_account_session_states - ONE canonical row per
+--         (user, source, session_id), whole-row-replaced on every change by
+--         the LWW upsert (tokentracker_upsert_account_session_states).
+--         Downward / model / bucket corrections all collapse into that one
+--         replace; cross-device duplication collapses because device_id is
+--         NOT part of the identity. Absence never deletes (contract NOT
+--         PROVEN). Mirrored by src/lib/account-usage-dedup.js (executable
+--         spec; semantics pinned by test/account-usage-dedup.test.js).
+-- DEPLOYMENT: this function reads tokentracker_account_session_states —
+-- apply the account-session-states migration BEFORE this updated RPC.
 -- The account-level source list MUST stay in sync with ACCOUNT_LEVEL_SOURCES in
 -- src/lib/source-metadata.js (parity asserted by test/account-source-parity.test.js).
 --
@@ -90,7 +104,7 @@ AS $func$
   ),
   -- Account-level source list — keep in sync with src/lib/source-metadata.js.
   cfg AS (
-    SELECT ARRAY['cursor']::text[] AS account_sources
+    SELECT ARRAY['cursor', 'trae-cn']::text[] AS account_sources
   ),
   -- Stage 1: canonicalize to the raw hour grain.
   hourly AS (
@@ -161,13 +175,14 @@ AS $func$
 
     UNION ALL
 
-    -- Account-level: ONE canonical whole row per (hour, source, model) across
-    -- ALL devices (NOT active-filtered — the data is device-independent and an
-    -- active-only filter would drop it if last synced by a since-revoked one).
-    SELECT acct.hour_start, acct.source, acct.model,
-      acct.total_tokens, acct.input_tokens, acct.output_tokens,
-      acct.cached_input_tokens, acct.cache_creation_input_tokens,
-      acct.reasoning_output_tokens, acct.conversations
+    -- 'cursor' (account-level, no session identity): rows are identical
+    -- across devices, so the legacy whole-row MAX pick per
+    -- (hour, source, model) dedups them. NOT active-device-filtered:
+    -- account truth follows the account, not which device last synced.
+    SELECT d.hour_start, d.source, d.model,
+      d.total_tokens, d.input_tokens, d.output_tokens,
+      d.cached_input_tokens, d.cache_creation_input_tokens,
+      d.reasoning_output_tokens, d.conversations
     FROM (
       SELECT DISTINCT ON (h.hour_start, h.source, h.model)
         h.hour_start, h.source, h.model,
@@ -178,13 +193,32 @@ AS $func$
         h.cache_creation_input_tokens::bigint AS cache_creation_input_tokens,
         h.reasoning_output_tokens::bigint     AS reasoning_output_tokens,
         h.conversations::bigint               AS conversations
-      FROM tokentracker_hourly h CROSS JOIN cfg
+      FROM tokentracker_hourly h
       WHERE h.user_id = p_user_id
         AND h.hour_start >= p_from
         AND h.hour_start <  p_to
-        AND h.source = ANY(cfg.account_sources)
+        AND h.source = 'cursor'
       ORDER BY h.hour_start, h.source, h.model, h.total_tokens DESC, h.updated_at DESC
-    ) acct
+    ) d
+
+    UNION ALL
+
+    -- trae-cn: canonical account truth from session states (one row per
+    -- session after the LWW upsert). NOT active-device-filtered.
+    SELECT s.bucket_start AS hour_start, s.source, s.model,
+      SUM(s.total_tokens)::bigint                AS total_tokens,
+      SUM(s.input_tokens)::bigint                AS input_tokens,
+      SUM(s.output_tokens)::bigint               AS output_tokens,
+      SUM(s.cached_input_tokens)::bigint         AS cached_input_tokens,
+      SUM(s.cache_creation_input_tokens)::bigint AS cache_creation_input_tokens,
+      SUM(s.reasoning_output_tokens)::bigint     AS reasoning_output_tokens,
+      COUNT(*)::bigint                           AS conversations
+    FROM tokentracker_account_session_states s
+    WHERE s.user_id = p_user_id
+      AND s.bucket_start >= p_from
+      AND s.bucket_start <  p_to
+      AND s.source = 'trae-cn'
+    GROUP BY s.bucket_start, s.source, s.model
   ),
   -- Stage 2: bucket the canonical hour rows to tz-local trunc, then aggregate.
   loc AS (
@@ -196,6 +230,18 @@ AS $func$
         ELSE ''
       END AS bucket,
       hourly.source, hourly.model,
+      CASE
+        WHEN lower(hourly.model) LIKE '%deepseek-v4-flash%'
+          OR lower(hourly.model) LIKE '%deepseek-v4-pro%'
+        THEN CASE
+          WHEN extract(hour FROM hourly.hour_start AT TIME ZONE 'UTC') >= 1
+               AND extract(hour FROM hourly.hour_start AT TIME ZONE 'UTC') < 4
+            OR extract(hour FROM hourly.hour_start AT TIME ZONE 'UTC') >= 6
+               AND extract(hour FROM hourly.hour_start AT TIME ZONE 'UTC') < 10
+          THEN 'peak' ELSE 'off_peak'
+        END
+        ELSE 'peak'
+      END AS pricing_tier,
       hourly.total_tokens, hourly.input_tokens, hourly.output_tokens,
       hourly.cached_input_tokens, hourly.cache_creation_input_tokens,
       hourly.reasoning_output_tokens, hourly.conversations
@@ -210,7 +256,7 @@ AS $func$
   ),
   grouped AS (
     SELECT
-      bucket, source, model,
+      bucket, source, model, pricing_tier,
       SUM(total_tokens)::bigint                AS total_tokens,
       SUM(input_tokens)::bigint                AS input_tokens,
       SUM(output_tokens)::bigint               AS output_tokens,
@@ -219,10 +265,10 @@ AS $func$
       SUM(reasoning_output_tokens)::bigint     AS reasoning_output_tokens,
       SUM(conversations)::bigint               AS conversations
     FROM loc
-    GROUP BY bucket, source, model
+    GROUP BY bucket, source, model, pricing_tier
   )
   SELECT COALESCE(
-           jsonb_agg(to_jsonb(grouped.*) ORDER BY grouped.bucket, grouped.source, grouped.model),
+           jsonb_agg(to_jsonb(grouped.*) ORDER BY grouped.bucket, grouped.source, grouped.model, grouped.pricing_tier),
            '[]'::jsonb
          )
   FROM grouped

@@ -85,7 +85,7 @@ interface GroupedRow {
 // branch intentionally ignores p_device_ids, so a per-device query would add
 // the user's ENTIRE account-level total to EVERY device (the "N identical
 // devices" skew). A device breakdown must therefore exclude them.
-const ACCOUNT_LEVEL_SOURCES = new Set<string>(["cursor"]);
+const ACCOUNT_LEVEL_SOURCES = new Set<string>(["cursor", "trae-cn"]);
 
 async function sumDeviceTokens(
   client: ReturnType<typeof createClient>,

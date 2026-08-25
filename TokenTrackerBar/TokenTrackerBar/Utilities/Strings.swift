@@ -254,6 +254,7 @@ enum Strings {
     static var menuPetSize: String { t("Pet Size", "桌宠大小", "桌寵大小", "ペットのサイズ", "펫 크기") }
     static var menuPetCharacter: String { t("Pet Character", "宠物形象", "寵物形象", "ペットのキャラクター", "펫 캐릭터") }
     static var petCharacterClawd: String { "Clawd" }
+    static var petCharacterBot: String { "Bot" }
     static var petCharacterSprout: String { "Sprout" }
     static var petCharacterByte: String { "Byte" }
     static var petCharacterEmber: String { "Ember" }

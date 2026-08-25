@@ -1,7 +1,7 @@
 {
   "name": "tokentracker-cli",
-  "version": "0.91.1",
-  "description": "Local-first AI coding token usage and cost tracker for 32 tools, with a dashboard, desktop pet, widgets, achievements, and native macOS/Windows apps.",
+  "version": "0.93.3",
+  "description": "Local-first AI coding token usage and cost tracker for 34 tools, with a dashboard, desktop pet, widgets, achievements, and native macOS/Windows apps.",
   "main": "src/cli.js",
   "bin": {
     "tokentracker-cli": "bin/tracker.js",
@@ -21,7 +21,7 @@
     "access": "public"
   },
   "scripts": {
-    "ci:local": "npm test && npm run validate:copy && npm run validate:locale && npm run validate:ui-hardcode && npm run validate:guardrails && npm run validate:versions && node --test test/architecture-guardrails.test.js && npm --prefix dashboard run build",
+    "ci:local": "npm test && npm run validate:copy && npm run validate:locale && npm run validate:ui-hardcode && npm run validate:guardrails && npm run validate:versions && npm run validate:bot-frames && node --test test/architecture-guardrails.test.js && npm --prefix dashboard run build",
     "copy:pull": "node scripts/copy-sync.cjs pull",
     "copy:push": "node scripts/copy-sync.cjs push",
     "dashboard:build": "npm --prefix dashboard run build",
@@ -38,6 +38,8 @@
     "pricing:build-seed": "node scripts/build-pricing-seed.cjs",
     "prepublishOnly": "node scripts/build-pricing-seed.cjs",
     "test": "node --test test/*.test.js",
+    "gen:bot-frames": "node scripts/gen-bot-frames.cjs",
+    "validate:bot-frames": "node scripts/gen-bot-frames.cjs --check",
     "validate:copy": "node scripts/validate-copy-registry.cjs",
     "validate:locale": "node scripts/validate-locale-coverage.cjs",
     "validate:guardrails": "node scripts/validate-architecture-guardrails.cjs",

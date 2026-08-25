@@ -602,6 +602,7 @@ pet.menubar.hint,ui,PetPage,PetPage,pet_menubar_hint,"Your pet replaces the menu
 settings.menubar.iconStyle,ui,WidgetsPage,MenuBarDisplayCard,mb_icon_style,"Menu bar icon",,active
 settings.menubar.iconStyleHint,ui,WidgetsPage,MenuBarDisplayCard,mb_icon_style_hint,"Choose who lives in the menu bar. The cat and your pet run faster while your AI tools are burning tokens.",,active
 settings.menubar.iconStyle.clawd,ui,WidgetsPage,MenuBarDisplayCard,mb_icon_style_clawd,"Clawd",,active
+settings.menubar.iconStyle.bot,ui,WidgetsPage,MenuBarDisplayCard,mb_icon_style_bot,"Bot",,active
 settings.menubar.iconStyle.cat,ui,WidgetsPage,MenuBarDisplayCard,mb_icon_style_cat,"Cat",,active
 settings.menubar.iconStyle.pet,ui,WidgetsPage,MenuBarDisplayCard,mb_icon_style_pet,"My pet",,active
 settings.menubar.iconStyle.static,ui,WidgetsPage,MenuBarDisplayCard,mb_icon_style_static,"Static",,active
@@ -767,6 +768,7 @@ limits.provider.antigravity,ui,LimitsPage,UsageLimitsPanel,provider_antigravity,
 limits.provider.zcode,ui,LimitsPage,UsageLimitsPanel,provider_zcode,"ZCode",,active
 provider.display.omp,ui,*,ProviderDisplay,omp,"oh-my-pi",,active
 provider.display.deepseek_harness,ui,*,ProviderDisplay,deepseek_harness,"DeepSeek Harness",,active
+provider.display.trae_work_cn,ui,*,ProviderDisplay,trae_work_cn,"TRAE Work CN",,active
 limits.label.zcode_glm52,ui,LimitsPage,UsageLimitsPanel,zcode_glm52,"GLM-5.2",,active
 limits.label.zcode_glm5t,ui,LimitsPage,UsageLimitsPanel,zcode_glm5t,"GLM-5-Turbo",,active
 limits.label.zcode_5h,ui,LimitsPage,UsageLimitsPanel,zcode_5h,"5h",,active
@@ -1244,14 +1246,12 @@ limits.label.qoder_cn_ultimate,ui,LimitsPage,UsageLimitsPanel,qoder_cn_ultimate,
 limits.qoder_calls.detail,ui,LimitsPage,UsageLimitsPanel,qoder_calls_detail,"{{used}} / {{limit}} calls used · {{remaining}} left",,active
 limits.hover.expires_at,ui,LimitsPage,UsageLimitsPanel,hover_expires_at,"Expires {{time}}",,active
 limits.opencodeGo.setupHint.title,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_title,"Connect OpenCode Go",,active
-limits.opencodeGo.setupHint.subtitle,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_subtitle,"Limits read from your signed-in opencode.ai session (no public API).",,active
-limits.opencodeGo.setupHint.step1,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_step1,"Sign in and open your Go workspace.",,active
+limits.opencodeGo.setupHint.subtitle,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_subtitle,"Reads your OpenCode Go usage from the official API (opencode.ai/zen/go/v1/usage).",,active
+limits.opencodeGo.setupHint.step1,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_step1,"Sign in at opencode.ai and subscribe to Go.",,active
 limits.opencodeGo.setupHint.cta,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_cta,"Open opencode.ai",,active
-limits.opencodeGo.setupHint.step2,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_step2,"Copy the auth cookie (and optionally workspace ID) from that page:",,active
-limits.opencodeGo.setupHint.step2_workspace,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_step2_workspace,"Workspace ID (optional): the wrk_… segment in the page URL.",,active
-limits.opencodeGo.setupHint.step2_cookie,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_step2_cookie,"auth cookie (required): DevTools ▸ Application ▸ Cookies ▸ opencode.ai ▸ auth.",,active
-limits.opencodeGo.setupHint.step3,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_step3,"Add to your shell profile, then restart the tracker:",,active
-limits.opencodeGo.setupHint.note_app,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_note_app,"macOS app: set with launchctl setenv, then reopen the app.",,active
+limits.opencodeGo.setupHint.step2,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_step2,"Create and copy an API key in the console.",,active
+limits.opencodeGo.setupHint.step3,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_step3,"Run this command, paste your API key (input stays invisible), then restart TokenTracker:",,active
+limits.opencodeGo.setupHint.note_app,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_note_app,"macOS app: use the launchctl setenv line, then reopen the app.",,active
 limits.opencodeGo.setupHint.copy,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_copy,"Copy",,active
 limits.opencodeGo.setupHint.copied,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_copied,"Copied",,active
 settings.menubar.updates.checking,ui,SettingsPage,NativeAppFooter,updates_checking,"Checking...","正在检测...",active
@@ -1277,6 +1277,16 @@ pet.characters.title,dashboard,PetPage,PetPage,characters_title,"Choose your com
 pet.characters.subtitle,dashboard,PetPage,PetPage,characters_subtitle,"Every character shares the full state system, with its own palette and silhouette.",,active
 pet.character.clawd,dashboard,PetPage,PetPage,character_clawd,"Clawd",,active
 pet.character.clawd_desc,dashboard,PetPage,PetPage,character_clawd_desc,"The original claw-shaped token keeper.",,active
+pet.character.bot,dashboard,PetPage,PetPage,character_bot,"Bot",,active
+pet.character.bot_desc,dashboard,PetPage,PetPage,character_bot_desc,"A single shape that morphs to match your token pace.",,active
+pet.bot.color,dashboard,PetPage,PetPage,bot_color,"Body colour",,active
+pet.bot.color.auto,dashboard,PetPage,PetPage,bot_color_auto,"Match theme",,active
+pet.bot.color.bleu,dashboard,PetPage,PetPage,bot_color_bleu,"Blue",,active
+pet.bot.color.turquoise,dashboard,PetPage,PetPage,bot_color_turquoise,"Teal",,active
+pet.bot.color.vert,dashboard,PetPage,PetPage,bot_color_vert,"Green",,active
+pet.bot.color.ambre,dashboard,PetPage,PetPage,bot_color_ambre,"Amber",,active
+pet.bot.color.rose,dashboard,PetPage,PetPage,bot_color_rose,"Pink",,active
+pet.bot.color.violet,dashboard,PetPage,PetPage,bot_color_violet,"Violet",,active
 pet.character.sprout,dashboard,PetPage,PetPage,character_sprout,"Sprout",,active
 pet.character.sprout_desc,dashboard,PetPage,PetPage,character_sprout_desc,"A leaf-eared seedling spirit with tiny root feet.",,active
 pet.character.byte,dashboard,PetPage,PetPage,character_byte,"Byte",,active

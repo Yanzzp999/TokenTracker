@@ -447,8 +447,8 @@ test("pricing covers production MiniMax and DeepSeek model ids used by leaderboa
   const cases = [
     ["MiniMax-M2.7", { input: 0.3, output: 1.2, cache_read: 0.06, cache_write: 0.375 }],
     ["MiniMax-M2.7-highspeed", { input: 0.6, output: 2.4, cache_read: 0.06, cache_write: 0.375 }],
-    ["deepseek-v4-flash", { input: 0.14, output: 0.28, cache_read: 0.0028, cache_write: 0.14 }],
-    ["deepseek-v4-pro", { input: 0.435, output: 0.87, cache_read: 0.003625, cache_write: 0.435 }],
+    ["deepseek-v4-flash", { input: 0.44, output: 1.32, cache_read: 0.014, cache_write: 0.44 }],
+    ["deepseek-v4-pro", { input: 1.32, output: 3.96, cache_read: 0.044, cache_write: 1.32 }],
   ];
 
   for (const [model, expected] of cases) {
@@ -465,8 +465,8 @@ test("leaderboard-refresh edge pricing covers MiniMax and DeepSeek model ids", (
   for (const snippet of [
     '"MiniMax-M2.7": { input: 0.3, output: 1.2, cache_read: 0.06, cache_write: 0.375 },',
     '"MiniMax-M2.7-highspeed": { input: 0.6, output: 2.4, cache_read: 0.06, cache_write: 0.375 },',
-    '"deepseek-v4-flash": { input: 0.14, output: 0.28, cache_read: 0.0028, cache_write: 0.14 },',
-    '"deepseek-v4-pro": { input: 0.435, output: 0.87, cache_read: 0.003625, cache_write: 0.435 },',
+    '"deepseek-v4-flash": { input: 0.44, output: 1.32, cache_read: 0.014, cache_write: 0.44 },',
+    '"deepseek-v4-pro": { input: 1.32, output: 3.96, cache_read: 0.044, cache_write: 1.32 },',
     'lower.includes("minimax-m2.7")',
     'lower.includes("deepseek-v4-flash")',
     'lower.includes("deepseek-v4-pro")',

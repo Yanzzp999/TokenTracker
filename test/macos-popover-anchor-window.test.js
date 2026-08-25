@@ -96,13 +96,28 @@ test("menu-bar popover restores Tahoe glass via deferred activation with a reali
   );
   assert.match(
     togglePopover,
-    /isOnActiveSpace[\s\S]*?reshowPopoverAfterFullScreenActivation\(\)/,
-    "When the anchor is not admitted onto the active (full-screen) Space, activation plus the one-shot re-show recovery must run.",
+    /isOnActiveSpace[\s\S]*?reshowPopoverOnActiveSpace\(\)/,
+    "When the popover is not admitted onto the active Space, activation plus the one-shot re-show recovery must run.",
+  );
+  assert.match(
+    togglePopover,
+    /let\s+popoverAdmitted\s*=\s*self\.popover\.contentViewController\?\.view\.window\?\.isOnActiveSpace/,
+    "Admission must be read off the popover window, not the anchor: the anchor is canJoinAllSpaces and reports admitted on every regular desktop even while the popover stayed pinned to another one (#506).",
+  );
+  assert.match(
+    togglePopover,
+    /if\s+let\s+reusedWindow\s*=\s*popover\.contentViewController\?\.view\.window\s*\{\s*reusedWindow\.collectionBehavior\.insert\(\[\.canJoinAllSpaces,\s*\.fullScreenAuxiliary\]\)\s*\}\s*popover\.show\(/,
+    "The reused _NSPopoverWindow must be marked canJoinAllSpaces BEFORE show() — the Space assignment happens inside show(), so the post-show insert lands too late and the popover renders on one desktop only (#506).",
   );
   assert.match(
     source,
-    /private\s+func\s+reshowPopoverAfterFullScreenActivation\(\)\s*\{[\s\S]*?guard\s+!popoverReshowAttempted\s+else\s*\{\s*return\s*\}[\s\S]*?popoverReshowAttempted\s*=\s*true[\s\S]*?togglePopover\(\)/,
-    "The full-screen re-show recovery must be latched to a single attempt so it can never loop.",
+    /private\s+func\s+reshowPopoverOnActiveSpace\(\)\s*\{[\s\S]*?guard\s+!popoverReshowAttempted\s+else\s*\{\s*return\s*\}[\s\S]*?popoverReshowAttempted\s*=\s*true[\s\S]*?togglePopover\(\)/,
+    "The re-show recovery must be latched to a single attempt so it can never loop.",
+  );
+  assert.match(
+    source,
+    /closePopoverIfShown\(\)\s*\n\s*\/\/[\s\S]*?DispatchQueue\.main\.async\s*\{\s*\[weak self\]\s*in\s*self\?\.togglePopover\(\)\s*\}/,
+    "A stranded popover must be re-shown on the next tick: the reused window has to order out first, and an inline toggle would be swallowed by the double-dispatch guard.",
   );
   assert.match(
     source,

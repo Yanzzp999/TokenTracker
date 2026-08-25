@@ -92,6 +92,20 @@ test("shared account cache cleanup cannot deadlock concurrent cold fills", () =>
   );
 });
 
+test("DeepSeek V4 time pricing survives account and leaderboard aggregation", () => {
+  const source = readMigrationBySuffix("deepseek-v4-time-pricing");
+  assert.match(source, /tokentracker_hourly_deepseek_v4_hour_idx/u);
+  assert.match(source, /RENAME TO account_usage_grouped_legacy_v1/u);
+  assert.match(source, /CREATE OR REPLACE FUNCTION public\.account_usage_grouped_v2/u);
+  assert.match(source, /v2-deepseek-time-pricing/u);
+  assert.match(source, /CREATE OR REPLACE FUNCTION public\.leaderboard_deepseek_v4_grouped/u);
+  assert.match(source, /THEN 'peak' ELSE 'off_peak'/u);
+  assert.match(source, /lower\(r\.model\) NOT LIKE '%deepseek-v4-flash%'/u);
+  assert.match(source, /public\.leaderboard_deepseek_v4_grouped\(p_from, p_to\)/u);
+  assert.match(source, /REVOKE ALL ON FUNCTION public\.account_usage_deepseek_v4_grouped/u);
+  assert.match(source, /REVOKE ALL ON FUNCTION public\.leaderboard_deepseek_v4_grouped/u);
+});
+
 test("leaderboard refresh fetches all user metadata with one RPC", () => {
   const source = read("dashboard/edge-patches/tokentracker-leaderboard-refresh.ts");
   assert.match(source, /rpc\("leaderboard_user_metadata"/u);

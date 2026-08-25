@@ -112,6 +112,7 @@ const {
   resolveDroidModel,
   resolveDshSessionFiles,
   parseDshIncremental,
+  parseTraeCnApiIncremental,
   bucketKey,
   toUtcHalfHourStart,
   totalsKey,
@@ -134,6 +135,11 @@ const {
   parseCursorCsv,
 } = require("../lib/cursor-config");
 const { purgeProjectUsage } = require("../lib/project-usage-purge");
+const {
+  fetchTraeCnUsageWithAuth,
+  resolveTraeCnStoragePath,
+  isTraeCnUsageEnabled,
+} = require("../lib/trae-cn-config");
 const {
   isCodexSessionCursorPath,
   isCursorStoreRetry,
@@ -291,6 +297,7 @@ const AUTO_SYNC_SOURCES = new Set([
   "qoder-cn",
   "reasonix",
   "roocode",
+  "trae-cn",
   "workbuddy",
   "zcode",
   "zed",
@@ -451,6 +458,15 @@ async function cmdSync(argv, context = {}) {
     : null;
   const lockWaitOptions = context && typeof context === "object"
     ? context.lockWaitOptions
+    : undefined;
+  // Narrow test-only seam for TRAE Work CN: deterministic injected fetch + a
+  // fixed "now" for the rolling range. Production keeps the global fetch and
+  // current time; no public CLI flag/config is introduced.
+  const traeCnFetchImpl = context && typeof context === "object"
+    ? context.traeCnFetchImpl
+    : undefined;
+  const traeCnNowMs = context && typeof context === "object"
+    ? context.traeCnNowMs
     : undefined;
   const syncDiagnostics = diagnostics && typeof diagnostics === "object" ? diagnostics : null;
   const home = os.homedir();
@@ -1663,6 +1679,93 @@ async function cmdSync(argv, context = {}) {
       }
     }
 
+    // ── Trae Work CN (国内版) — account-level usage API ──
+    // A simple explicit rolling 30-day window captured once per sync (no
+    // cursor checkpoints / full-history import / page retries / background
+    // requests). Runs only when the user has opted in via
+    // TOKENTRACKER_TRAE_CN_USAGE=1 (the read transmits the locally stored
+    // sign-in JWT to TRAE's official endpoint, so it is never default-on),
+    // the sync is non-lightweight, the source is allowed, and the CN storage
+    // file exists — which excludes both ordinary background and `--auto
+    // --background --all-local-sources`. Fetching goes through the
+    // storage-backed helper so its single 401/403 reread/retry is used; an
+    // empty response is a successful no-op; each window is bounded to 100
+    // pages/2,000 rows and an over-capacity window is split into staggered
+    // sub-windows (still over capacity at the finest allowed granularity, or
+    // any other fetch/page/schema/auth failure) skips the parser and leaves
+    // prior data untouched while unrelated providers continue.
+    let traeCnResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+    if (
+      !isBackgroundLightweightSync &&
+      isTraeCnUsageEnabled(process.env) &&
+      sourceAllowed("trae-cn")
+    ) {
+      const nowMs = Number.isFinite(traeCnNowMs) ? traeCnNowMs : Date.now();
+      const fetchImpl = typeof traeCnFetchImpl === "function" ? traeCnFetchImpl : fetch;
+      const endTime = Math.floor(nowMs / 1000);
+      // Align the REAL fetch start down to a half-hour boundary so the API
+      // range fully contains every bucket it can touch (a raw 08:37 start
+      // would only partially cover the 08:30 bucket) - session bucket floors
+      // never straddle the queried range.
+      const HALF_HOUR_SEC = 30 * 60;
+      const startTime = Math.max(
+        1,
+        Math.floor((endTime - 30 * 24 * 60 * 60) / HALF_HOUR_SEC) * HALF_HOUR_SEC,
+      );
+      try {
+        // Absent storage means "not signed in" — a silent skip, not an error.
+        const traeCnStoragePath = resolveTraeCnStoragePath({ env: process.env, home });
+        if (traeCnStoragePath && fssync.existsSync(traeCnStoragePath)) {
+          if (progress?.enabled) {
+            progress.start(`Fetching TRAE Work CN usage...`);
+          }
+          const traeCnUsage = await fetchTraeCnUsageWithAuth({
+            start_time: startTime,
+            end_time: endTime,
+            fetchImpl,
+            env: process.env,
+            home,
+          });
+          const traeCnSessions = Array.isArray(traeCnUsage?.sessions) ? traeCnUsage.sessions : [];
+          // An empty payload parses as a pure no-op: the TRAE absence
+          // contract is NOT PROVEN (no evidence that a missing session means
+          // deleted/zero), so an empty response asserts nothing - no usage
+          // mutation and no session states. Non-empty snapshots append one
+          // canonical session-state observation per CHANGED session (the
+          // cloud LWW upsert reconciles cross-device versions).
+          {
+            if (progress?.enabled && traeCnSessions.length > 0) {
+              progress.start(
+                `Parsing TRAE Work CN ${renderBar(0)} 0/${formatNumber(
+                  traeCnSessions.length,
+                )} records | buckets 0`,
+              );
+            }
+            traeCnResult = await parseTraeCnApiIncremental({
+              sessions: traeCnSessions,
+              cursors,
+              queuePath,
+              onProgress: makeProviderProgress("TRAE Work CN"),
+              windowStartMs: startTime * 1000,
+              windowEndMs: endTime * 1000,
+              // The LOGICAL fetch stamp carried into every session state's
+              // snapshot_verified_at: the same clock that produced the query
+              // range, not the later enqueue moment (append-only queue
+              // replays it verbatim, so transport retries never fake
+              // freshness).
+              snapshotVerifiedAtMs: nowMs,
+            });
+            // A partially malformed snapshot throws inside the parser (fail
+            // closed - it must not become the authoritative window state);
+            // warnProviderParseFailure below reports it without sensitive
+            // data while unrelated providers continue.
+          }
+        }
+      } catch (err) {
+        warnProviderParseFailure("TRAE Work CN", err, opts);
+      }
+    }
+
     // ── Kiro (SQLite-based, with JSONL fallback; dual-install aware) ──
     let kiroResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
     if (sourceAllowed("kiro")) {
@@ -2157,7 +2260,12 @@ async function cmdSync(argv, context = {}) {
     }
 
     // ── Grok Build (xAI) ──
-    let grokResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+    let grokResult = {
+      recordsProcessed: 0,
+      eventsAggregated: 0,
+      bucketsQueued: 0,
+      projectBucketsQueued: 0,
+    };
     // Full passive scan of all Grok sessions (historical + any not covered by hook)
     const grokSessions = sourceAllowed("grok") ? resolveGrokBuildSessions(process.env) : [];
     const grokSessionInputs = [...grokSessions];
@@ -2179,6 +2287,11 @@ async function cmdSync(argv, context = {}) {
           sessionId: hookSessionId,
           sessionDir:
             typeof grokHookSignal.sessionDir === "string" ? grokHookSignal.sessionDir : undefined,
+          cwd: typeof grokHookSignal.cwd === "string" ? grokHookSignal.cwd : undefined,
+          encodedCwd:
+            typeof grokHookSignal.sessionDir === "string" && grokHookSignal.sessionDir
+              ? path.basename(path.dirname(grokHookSignal.sessionDir))
+              : undefined,
           updatesPath:
             typeof grokHookSignal.updatesPath === "string" ? grokHookSignal.updatesPath : undefined,
           signalsPath:
@@ -2208,6 +2321,7 @@ async function cmdSync(argv, context = {}) {
           sessions: grokSessionInputs,
           cursors,
           queuePath,
+          projectQueuePath,
           env: process.env,
           onProgress: (p) => {
             if (!progress?.enabled) return;
@@ -2224,6 +2338,8 @@ async function cmdSync(argv, context = {}) {
         recordsProcessed: grokResult.recordsProcessed + grokScanResult.recordsProcessed,
         eventsAggregated: grokResult.eventsAggregated + grokScanResult.eventsAggregated,
         bucketsQueued: grokResult.bucketsQueued + grokScanResult.bucketsQueued,
+        projectBucketsQueued:
+          (grokResult.projectBucketsQueued || 0) + (grokScanResult.projectBucketsQueued || 0),
       };
     }
     if (isFullSourceScan && opts.repairGrok) {
@@ -2584,6 +2700,7 @@ async function cmdSync(argv, context = {}) {
       qoderCnResult.recordsProcessed +
       claudeScienceResult.recordsProcessed +
       cursorResult.recordsProcessed +
+      traeCnResult.recordsProcessed +
       kiroResult.recordsProcessed +
       kiroCliResult.recordsProcessed +
       hermesResult.recordsProcessed +
@@ -2619,6 +2736,7 @@ async function cmdSync(argv, context = {}) {
       qoderCnResult.bucketsQueued +
       claudeScienceResult.bucketsQueued +
       cursorResult.bucketsQueued +
+      traeCnResult.bucketsQueued +
       kiroResult.bucketsQueued +
       kiroCliResult.bucketsQueued +
       hermesResult.bucketsQueued +
@@ -2650,6 +2768,7 @@ async function cmdSync(argv, context = {}) {
       cursorStore.requiresCommit !== true &&
       totalParsed === 0 &&
       totalBuckets === 0 &&
+      !(grokResult.projectBucketsQueued > 0) &&
       !codexColdAuditDue &&
       !codexFallbackRetryRan &&
       !grokHookSignalConsumed &&
@@ -2972,6 +3091,8 @@ function recordCodexColdScanAudit(
 module.exports = {
   cmdSync,
   acquireSyncLock,
+  readQueueBatch,
+  drainQueueToCloud,
   migrateCursorUnknownBuckets,
   migrateRolloutCumulativeDeltaBuckets,
   repairCodebuddyLogJsonlOverlap,
@@ -3472,7 +3593,10 @@ async function drainQueueToCloud({ baseUrl, deviceToken, queuePath, queueStatePa
   for (let batch = 0; batch < maxBatches; batch++) {
     if (offset >= queueSize) break;
     const result = await readQueueBatch(queuePath, offset, limit);
-    if (result.buckets.length === 0) break;
+    // A states-only tail (e.g. a retry batch whose bucket rows already
+    // uploaded) is still a meaningful upload: it advances the canonical
+    // session corrections cloud-side.
+    if (result.buckets.length === 0 && result.sessionStates.length === 0) break;
 
     const root = baseUrl.replace(/\/$/, "");
     const anonKey = process.env.TOKENTRACKER_INSFORGE_ANON_KEY || "";
@@ -3485,7 +3609,12 @@ async function drainQueueToCloud({ baseUrl, deviceToken, queuePath, queueStatePa
     const res = await fetch(`${root}/functions/${INGEST_SLUG}`, {
       method: "POST",
       headers,
-      body: JSON.stringify({ hourly: result.buckets }),
+      body: JSON.stringify({
+        hourly: result.buckets,
+        ...(result.sessionStates.length > 0
+          ? { account_session_states: result.sessionStates }
+          : {}),
+      }),
     });
 
     const rawText = await res.text().catch(() => "");
@@ -3522,6 +3651,26 @@ async function readQueueBatch(queuePath, startOffset, maxBuckets) {
   const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
 
   const bucketMap = new Map();
+  // Account session states (kind: "account_session_state") are queue
+  // control records, not usage rows: collect them separately so they ride
+  // the same upload (after the bucket rows in file order) without entering
+  // the bucket stream. Keyed by (source, session_id) LAST-WINS: the
+  // append-only queue writes a session's newer observation after its older
+  // one, and only the latest per session may reach the ingest batch (a
+  // duplicate would make the cloud ON CONFLICT affect one row twice).
+  // snapshot_verified_at rides along verbatim from the ORIGINAL fetch, so a
+  // transport retry never fakes logical freshness.
+  //
+  // Batching: session-state records count toward the SAME per-batch record
+  // cap (maxBuckets) as bucket rows. The ingest edge rejects a request with
+  // more than 500 states (HTTP 400); before they counted, a states-heavy
+  // queue (a fresh device's first 30-day TRAE sync appends one record per
+  // observed session) was read in ONE uncapped batch - the 400 left the
+  // queue offset untouched and every retry re-read the identical oversized
+  // request, a permanent upload failure. With the default batchSize of 200
+  // (and the MAX_INGEST_BUCKETS=500 clamp above), every request stays under
+  // the edge cap while batching follows the existing design.
+  const sessionStateMap = new Map();
   let offset = startOffset;
   let linesRead = 0;
   for await (const line of rl) {
@@ -3534,6 +3683,37 @@ async function readQueueBatch(queuePath, startOffset, maxBuckets) {
     } catch (_e) {
       continue;
     }
+    if (bucket?.kind === "account_session_state") {
+      if (typeof bucket.source === "string" && typeof bucket.session_id === "string" && bucket.session_id.trim()) {
+        const ssSource = bucket.source.trim().toLowerCase();
+        sessionStateMap.set(ssSource + "|" + bucket.session_id.trim(), {
+          source: ssSource,
+          session_id: bucket.session_id.trim(),
+          model: typeof bucket.model === "string" ? bucket.model : "",
+          bucket_start: typeof bucket.bucket_start === "string" ? bucket.bucket_start : "",
+          input_tokens: Number(bucket.input_tokens) || 0,
+          output_tokens: Number(bucket.output_tokens) || 0,
+          cached_input_tokens: Number(bucket.cached_input_tokens) || 0,
+          cache_creation_input_tokens: Number(bucket.cache_creation_input_tokens) || 0,
+          reasoning_output_tokens: Number(bucket.reasoning_output_tokens) || 0,
+          total_tokens: Number(bucket.total_tokens) || 0,
+          ...(typeof bucket.snapshot_verified_at === "string" && bucket.snapshot_verified_at
+            ? { snapshot_verified_at: bucket.snapshot_verified_at }
+            : {}),
+        });
+        // Counted like a bucket row: the record rides THIS batch and its
+        // bytes are covered by nextOffset, so the next batch resumes right
+        // after it.
+        linesRead += 1;
+        if (linesRead >= maxBuckets) break;
+      }
+      continue;
+    }
+    // Pre-release watermark records from this feature branch's dev queues
+    // are obsolete control records: drop them instead of letting them enter
+    // the bucket stream (they carry no hour_start and would be skipped
+    // downstream anyway, but be explicit).
+    if (bucket?.kind === "account_sync_watermark") continue;
     const hourStart = typeof bucket?.hour_start === "string" ? bucket.hour_start : null;
     if (!hourStart) continue;
     const source = (typeof bucket?.source === "string" ? bucket.source.trim().toLowerCase() : "") || "codex";
@@ -3553,7 +3733,11 @@ async function readQueueBatch(queuePath, startOffset, maxBuckets) {
 
   rl.close();
   stream.close?.();
-  return { buckets: Array.from(bucketMap.values()), nextOffset: offset };
+  return {
+    buckets: Array.from(bucketMap.values()),
+    sessionStates: Array.from(sessionStateMap.values()),
+    nextOffset: offset,
+  };
 }
 
 function normalizeGrokRepairSource(value) {
