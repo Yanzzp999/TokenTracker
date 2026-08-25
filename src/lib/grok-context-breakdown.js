@@ -26,8 +26,9 @@ const {
   sanitizeCommandSignature,
   getExecutableName,
 } = require("./categorizer-utils");
+const { normalizeGrokUsage } = require("./grok-usage");
 
-const CACHE_SCHEMA_VERSION = "grok-context-v2";
+const CACHE_SCHEMA_VERSION = "grok-context-v3";
 const CACHE = new Map();
 // Result-level TTL. Per-file parse cache is the main win when flipping tabs.
 const CACHE_TTL_MS = 5 * 60_000;
@@ -246,31 +247,7 @@ function outputSizeBucket(lines, chars) {
 }
 
 function readUsageTotals(usage) {
-  if (!usage || typeof usage !== "object") return null;
-  const inputRaw = Math.max(0, Number(usage.inputTokens ?? usage.input_tokens ?? 0) || 0);
-  const cached = Math.max(
-    0,
-    Number(usage.cachedReadTokens ?? usage.cache_read_input_tokens ?? usage.cached_input_tokens ?? 0) || 0,
-  );
-  const output = Math.max(0, Number(usage.outputTokens ?? usage.output_tokens ?? 0) || 0);
-  const reasoning = Math.max(
-    0,
-    Number(usage.reasoningTokens ?? usage.reasoning_output_tokens ?? 0) || 0,
-  );
-  const nonCachedInput = Math.max(0, inputRaw - cached);
-  // Prefer the reported totalTokens (authoritative billable total). Fallback
-  // includes reasoning so a missing total still matches usage-parser shape.
-  let total = Math.max(0, Number(usage.totalTokens ?? usage.total_tokens ?? 0) || 0);
-  if (total <= 0) total = nonCachedInput + cached + output + reasoning;
-  if (total <= 0) return null;
-  return {
-    input_tokens: nonCachedInput,
-    cached_input_tokens: cached,
-    cache_creation_input_tokens: 0,
-    output_tokens: output,
-    reasoning_output_tokens: reasoning,
-    total_tokens: total,
-  };
+  return normalizeGrokUsage(usage);
 }
 
 // ---------------------------------------------------------------------------
@@ -778,15 +755,17 @@ async function computeGrokContextBreakdownUncached({
     }))
     .sort((a, b) => (b.totals?.total_tokens || 0) - (a.totals?.total_tokens || 0));
 
-  // Message breakdown: residual "text_response" tools + reasoning/output split
-  const textResponse = toolRows.find((r) => r.name === "text_response");
-  const textTotals = textResponse?.totals || emptyTotals();
+  // Message breakdown uses the same mutually exclusive columns as the parser.
+  // Grok's raw outputTokens includes reasoning, but readUsageTotals has already
+  // split it, so subtracting reasoning here would undercount assistant output.
   const reasoning = Number(grand.reasoning_output_tokens || 0);
-  const assistantOut = Math.max(0, Number(grand.output_tokens || 0) - Math.min(reasoning, Number(grand.output_tokens || 0)));
+  const assistantOut = Number(grand.output_tokens || 0);
   // For Grok, cached reads dominate conversation history; non-cached input is
   // closer to "current user/context injection". Heuristic only — matches Codex
   // message_breakdown intent without reading message bodies.
-  const historyTokens = Number(grand.cached_input_tokens || 0);
+  const cachedHistoryTokens = Number(grand.cached_input_tokens || 0);
+  const cacheCreationTokens = Number(grand.cache_creation_input_tokens || 0);
+  const historyTokens = cachedHistoryTokens + cacheCreationTokens;
   const userish = Number(grand.input_tokens || 0);
   const messageBreakdown = [
     {
@@ -806,8 +785,8 @@ async function computeGrokContextBreakdownUncached({
       name: "Conversation history",
       totals: roundTotals({
         input_tokens: 0,
-        cached_input_tokens: historyTokens,
-        cache_creation_input_tokens: 0,
+        cached_input_tokens: cachedHistoryTokens,
+        cache_creation_input_tokens: cacheCreationTokens,
         output_tokens: 0,
         reasoning_output_tokens: 0,
         total_tokens: historyTokens,
@@ -823,6 +802,18 @@ async function computeGrokContextBreakdownUncached({
         output_tokens: assistantOut,
         reasoning_output_tokens: 0,
         total_tokens: assistantOut,
+      }),
+    },
+    {
+      key: "reasoning",
+      name: "Reasoning",
+      totals: roundTotals({
+        input_tokens: 0,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        output_tokens: 0,
+        reasoning_output_tokens: reasoning,
+        total_tokens: reasoning,
       }),
     },
   ].sort((a, b) => (b.totals?.total_tokens || 0) - (a.totals?.total_tokens || 0));

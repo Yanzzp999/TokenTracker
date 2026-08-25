@@ -81,7 +81,7 @@ const response = {
       source: "grok",
       project_key: "alphafox-web",
       project_ref: "/work/alphafox-web",
-      model: "grok-4.5-build-free",
+      model: "grok-4.6",
       started_at: "2026-07-22T08:00:00Z",
       ended_at: "2026-07-22T08:15:00Z",
       duration_ms: 900_000,
@@ -89,8 +89,27 @@ const response = {
       edit_turns: 1,
       retry_turns: 0,
       subagent_calls: 0,
-      total_tokens: 21_000,
-      cost_usd: 0,
+      input_tokens: 8_586,
+      cached_input_tokens: 192_896,
+      cache_creation_input_tokens: 0,
+      output_tokens: 1_391,
+      reasoning_output_tokens: 1_420,
+      total_tokens: 204_293,
+      cost_usd: 0.130486,
+      cost_source: "provider_reported",
+      usage_precision: "reported",
+      usage_is_incomplete: false,
+      cost_is_partial: false,
+      usage_events: 2,
+      model_calls: 7,
+      api_duration_ms: 55_909,
+      context_tokens_used: 31_445,
+      context_window_tokens: 500_000,
+      context_usage_percent: 6,
+      tool_calls: 5,
+      tool_failures: 0,
+      error_count: 1,
+      compaction_count: 0,
       productive: true,
       first_pass: true,
       resume_command: "grok --resume 019f740c-e792-7fb1-a218-59ea1b340714",
@@ -111,6 +130,10 @@ describe("SessionsPage", () => {
     expect(await screen.findByText("Fix authentication flow")).toBeInTheDocument();
     expect(screen.getByText("Review release")).toBeInTheDocument();
     expect(screen.getByText("Debug local proxy")).toBeInTheDocument();
+    expect(screen.getByText("Reported cost")).toBeInTheDocument();
+    expect(screen.getByText("Input 8.6K · Cache read 192.9K · Cache write 0 · Output 1.4K · Reasoning 1.4K")).toBeInTheDocument();
+    expect(screen.getByText("Model calls 7 · API 55.9s · Tools 5 · Errors 1")).toBeInTheDocument();
+    expect(screen.getByText("Context 31.4K / 500K (6%)")).toBeInTheDocument();
     // The whole list is fetched once; no row cap and no server-side window.
     expect(getSessions).toHaveBeenCalledWith({ refresh: false });
 

@@ -11,6 +11,7 @@ const {
   resolveGrokBuildSessions,
 } = require("../src/lib/rollout");
 const { computeRowCost, ensurePricingLoaded, getModelPricing } = require("../src/lib/pricing");
+const { normalizeGrokUsage } = require("../src/lib/grok-usage");
 
 function makeSession({
   sessionId = "019f0000-test-session",
@@ -116,6 +117,55 @@ function dedupeQueue(rows) {
   return [...seen.values()];
 }
 
+test("normalizeGrokUsage handles ACP cache writes, reasoning, and cost completeness", () => {
+  const reported = normalizeGrokUsage({
+    inputTokens: 100,
+    cachedReadTokens: 20,
+    cacheCreationTokens: 10,
+    outputTokens: 30,
+    reasoningTokens: 10,
+    totalTokens: 130,
+    costUsdTicks: 123_000_000,
+    modelCalls: 2,
+    apiDurationMs: 456,
+  });
+  assert.deepEqual(reported, {
+    input_tokens: 70,
+    cached_input_tokens: 20,
+    cache_creation_input_tokens: 10,
+    output_tokens: 20,
+    reasoning_output_tokens: 10,
+    total_tokens: 130,
+    billable_total_tokens: 130,
+    total_cost_usd: 0.0123,
+    cost_is_partial: false,
+    usage_is_incomplete: false,
+    model_calls: 2,
+    api_duration_ms: 456,
+  });
+
+  const partial = normalizeGrokUsage({
+    inputTokens: 10,
+    outputTokens: 2,
+    totalTokens: 12,
+    costUsdTicks: 50_000_000,
+    costIsPartial: true,
+  });
+  assert.equal(partial.total_cost_usd, null);
+  assert.equal(partial.cost_is_partial, true);
+
+  const headless = normalizeGrokUsage({
+    input_tokens: 70,
+    cache_read_input_tokens: 20,
+    cache_creation_input_tokens: 10,
+    output_tokens: 30,
+    reasoning_output_tokens: 10,
+    total_tokens: 130,
+  });
+  assert.equal(headless.input_tokens, 70, "snake_case input is already non-cached");
+  assert.equal(headless.output_tokens, 20);
+});
+
 test("parseGrokBuildIncremental prefers turn_completed.usage over context-window totalTokens", async () => {
   const fixture = makeSession({
     contextMetas: [10_000, 40_000, 90_000],
@@ -126,14 +176,18 @@ test("parseGrokBuildIncremental prefers turn_completed.usage over context-window
           outputTokens: 500,
           totalTokens: 100_500,
           cachedReadTokens: 20_000,
+          cacheCreationTokens: 500,
           reasoningTokens: 100,
+          costUsdTicks: 1_000_000_000,
           modelUsage: {
             "grok-4.5-build": {
               inputTokens: 100_000,
               outputTokens: 500,
               totalTokens: 100_500,
               cachedReadTokens: 20_000,
+              cacheCreationTokens: 500,
               reasoningTokens: 100,
+              costUsdTicks: 1_000_000_000,
             },
           },
         },
@@ -145,14 +199,18 @@ test("parseGrokBuildIncremental prefers turn_completed.usage over context-window
           outputTokens: 200,
           totalTokens: 50_200,
           cachedReadTokens: 10_000,
+          cacheCreationTokens: 200,
           reasoningTokens: 40,
+          costUsdTicks: 500_000_000,
           modelUsage: {
             "grok-4.5-build": {
               inputTokens: 50_000,
               outputTokens: 200,
               totalTokens: 50_200,
               cachedReadTokens: 10_000,
+              cacheCreationTokens: 200,
               reasoningTokens: 40,
+              costUsdTicks: 500_000_000,
             },
           },
         },
@@ -175,7 +233,7 @@ test("parseGrokBuildIncremental prefers turn_completed.usage over context-window
   });
 
   assert.equal(result.eventsAggregated, 2);
-  assert.equal(cursors.grok.version, 4);
+  assert.equal(cursors.grok.version, 5);
 
   const snap = cursors.grok.sessionSnapshots[fixture.sessionId];
   assert.ok(snap);
@@ -187,11 +245,25 @@ test("parseGrokBuildIncremental prefers turn_completed.usage over context-window
   const row = rows[0];
   assert.equal(row.model, "grok-4.5-build");
   assert.equal(row.total_tokens, 150_700);
-  assert.equal(row.input_tokens, 120_000);
+  assert.equal(row.input_tokens, 119_300);
   assert.equal(row.cached_input_tokens, 30_000);
-  assert.equal(row.output_tokens, 700);
+  assert.equal(row.cache_creation_input_tokens, 700);
+  assert.equal(row.output_tokens, 560);
   assert.equal(row.reasoning_output_tokens, 140);
+  assert.equal(row.total_cost_usd, 0.15);
+  assert.equal(computeRowCost(row), 0.15);
+  assert.equal(row.usage_precision, "reported");
   assert.equal(row.conversation_count, 2);
+
+  const secondResult = await parseGrokBuildIncremental({
+    sessions: resolveGrokBuildSessions(fixture.env),
+    cursors,
+    queuePath,
+    env: fixture.env,
+  });
+  assert.equal(secondResult.eventsAggregated, 0);
+  assert.equal(secondResult.bucketsQueued, 0);
+  assert.deepEqual(dedupeQueue(readQueue(queuePath)), [row]);
 });
 
 test("parseGrokBuildIncremental canonicalizes free Build SKU so pricing stays $0", async () => {
@@ -265,9 +337,10 @@ test("parseGrokBuildIncremental falls back to context watermark only without tur
   assert.equal(rows.length, 1);
   assert.equal(rows[0].total_tokens, 20_000);
   assert.equal(rows[0].input_tokens + rows[0].output_tokens, 20_000);
+  assert.equal(rows[0].usage_precision, "estimated");
 });
 
-test("v3 -> v4 migration rebuilds from turn usage and does not keep old watermark totals", async () => {
+test("v4 -> v5 migration rebuilds Grok rows with mutually exclusive token columns", async () => {
   const fixture = makeSession({
     turns: [
       {
@@ -312,7 +385,7 @@ test("v3 -> v4 migration rebuilds from turn usage and does not keep old watermar
       groupQueued: {},
     },
     grok: {
-      version: 3,
+      version: 4,
       sessionSnapshots: {
         [fixture.sessionId]: {
           totalTokens: 9000,
@@ -348,7 +421,7 @@ test("v3 -> v4 migration rebuilds from turn usage and does not keep old watermar
     env: fixture.env,
   });
 
-  assert.equal(cursors.grok.version, 4);
+  assert.equal(cursors.grok.version, 5);
   assert.equal(cursors.grok.sessionSnapshots[fixture.sessionId].totalTokens, 81_000);
   const rows = dedupeQueue(readQueue(queuePath));
   const row = rows.find((r) => r.model === "grok-4.5");

@@ -2287,6 +2287,8 @@ function createLocalApiHandler({ queuePath }) {
         ma.totals.cached_input_tokens += row.cached_input_tokens || 0;
         ma.totals.cache_creation_input_tokens += row.cache_creation_input_tokens || 0;
         ma.totals.reasoning_output_tokens += row.reasoning_output_tokens || 0;
+        ma.totals.total_cost_usd = Number(ma.totals.total_cost_usd || 0)
+          + (Number(row.total_cost_usd) || 0);
       }
 
       const sources = Array.from(bySource.values()).map((s) => {

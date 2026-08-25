@@ -31,6 +31,7 @@ const readline = require("node:readline");
 const { listClaudeProjectFiles, listRolloutFilesDeep, claudeMessageDedupKey } = require("./rollout");
 const { parseCodexRolloutFile } = require("./codex-rollout-parser");
 const { computeRowCost } = require("./pricing");
+const { USD_TICKS_PER_USD, normalizeGrokUsage } = require("./grok-usage");
 const wsl = require("./wsl-probe");
 
 // Bump the sidecar when derived metrics change so cached rows are rebuilt
@@ -54,7 +55,9 @@ const wsl = require("./wsl-probe");
 // stay valid while Grok entries appear on the next full rebuild.
 // v11 groups native/WSL copies of one logical Claude/Codex session and scans
 // their union, deduping shared records while retaining divergent tails.
-const SIDECAR_VERSION = 11;
+// v12 fixes Grok's mutually exclusive token columns, retains exact reported
+// cost, and adds metadata-only usage diagnostics to the local session browser.
+const SIDECAR_VERSION = 12;
 const EDIT_TOOLS = new Set([
   "apply_patch",
   "edit",
@@ -238,7 +241,12 @@ function finalizeRecord(record) {
   record.active_ms = Math.max(0, finite(record.active_ms));
   record.duration_ms = record.active_ms;
   record.total_tokens = finite(record.total_tokens || record.tokens?.total_tokens);
-  record.cost_usd = computeRowCost({ source: record.source, model: record.model, ...record.tokens });
+  const providerCost = Number(record.provider_cost_usd);
+  record.cost_usd = record.cost_source === "provider_reported"
+    && Number.isFinite(providerCost)
+    && providerCost >= 0
+    ? providerCost
+    : computeRowCost({ source: record.source, model: record.model, ...record.tokens });
   record.productive = record.edit_turns > 0;
   // A first-pass delivery has exactly one user turn containing an observed
   // edit and no repeated user request. The legacy one_shot field stays as an
@@ -569,42 +577,6 @@ function grokTimestampIso(obj) {
   return new Date(ms).toISOString();
 }
 
-// Grok reports inputTokens as the full prompt (including cache hits). Split so
-// pricing can apply cache_read rates correctly — same authority as the usage
-// parser and grok-context-breakdown.readUsageTotals. Prefer the reported
-// totalTokens; do not re-sum input+cached (that double-counts cache hits).
-function grokUsageTotals(usage) {
-  if (!usage || typeof usage !== "object") return emptyTotals();
-  const inputRaw = finite(usage.inputTokens ?? usage.input_tokens);
-  const cached_input_tokens = finite(
-    usage.cachedReadTokens ?? usage.cache_read_input_tokens ?? usage.cached_input_tokens,
-  );
-  const cache_creation_input_tokens = finite(
-    usage.cachedWriteTokens ?? usage.cache_creation_input_tokens,
-  );
-  const output_tokens = finite(usage.outputTokens ?? usage.output_tokens);
-  const reasoning_output_tokens = finite(
-    usage.reasoningTokens ?? usage.reasoning_output_tokens,
-  );
-  const input_tokens = Math.max(0, inputRaw - cached_input_tokens);
-  let total_tokens = finite(usage.totalTokens ?? usage.total_tokens);
-  if (total_tokens <= 0) {
-    total_tokens = input_tokens
-      + cached_input_tokens
-      + cache_creation_input_tokens
-      + output_tokens
-      + reasoning_output_tokens;
-  }
-  return {
-    input_tokens,
-    cached_input_tokens,
-    cache_creation_input_tokens,
-    output_tokens,
-    reasoning_output_tokens,
-    total_tokens,
-  };
-}
-
 function pickGrokModel(usage, fallback) {
   const modelUsage = usage?.modelUsage;
   if (modelUsage && typeof modelUsage === "object") {
@@ -704,6 +676,13 @@ async function scanGrokSession(filePath) {
   let currentHadEdit = false;
   let subagentCalls = 0;
   const subagentTypes = new Map();
+  let usageEvents = 0;
+  let providerCostEvents = 0;
+  let providerCostUsd = 0;
+  let modelCalls = 0;
+  let apiDurationMs = 0;
+  let usageIsIncomplete = false;
+  let costIsPartial = false;
   let lastPromptFingerprint = null;
   // Grok streams user_message_chunk pieces for one prompt. Accumulate until
   // turn_completed, then fingerprint the full prompt for retry detection.
@@ -772,7 +751,21 @@ async function scanGrokSession(filePath) {
     if (sessionUpdate === "turn_completed") {
       closeTurn();
       const usage = update.usage;
-      addTotals(tokens, grokUsageTotals(usage));
+      const normalizedUsage = normalizeGrokUsage(usage);
+      if (normalizedUsage) {
+        usageEvents += 1;
+        addTotals(tokens, normalizedUsage);
+        modelCalls += finite(normalizedUsage.model_calls);
+        apiDurationMs += finite(normalizedUsage.api_duration_ms);
+        usageIsIncomplete ||= normalizedUsage.usage_is_incomplete;
+        costIsPartial ||= normalizedUsage.cost_is_partial;
+        if (normalizedUsage.total_cost_usd != null) {
+          providerCostEvents += 1;
+          providerCostUsd = Math.round(
+            (providerCostUsd + normalizedUsage.total_cost_usd) * USD_TICKS_PER_USD,
+          ) / USD_TICKS_PER_USD;
+        }
+      }
       const candidate = pickGrokModel(usage, model);
       if (candidate && candidate !== "unknown") model = candidate;
       continue;
@@ -796,6 +789,11 @@ async function scanGrokSession(filePath) {
     model = normalizeSessionModel(signals.primaryModelId) || model;
   }
 
+  const hasCompleteProviderCost = usageEvents > 0
+    && providerCostEvents === usageEvents
+    && !usageIsIncomplete
+    && !costIsPartial;
+
   return finalizeRecord({
     version: SIDECAR_VERSION,
     session_hash: sessionHash("grok", observedSessionId || filePath),
@@ -813,7 +811,29 @@ async function scanGrokSession(filePath) {
     subagent_calls: subagentCalls,
     subagent_types: Object.fromEntries([...subagentTypes.entries()].sort()),
     tokens,
-    provenance: { source: "local-session-log", confidence: "observed", retry_confidence: "inferred", content_retained: false },
+    usage_events: usageEvents,
+    usage_precision: usageIsIncomplete ? "reported_incomplete" : (usageEvents > 0 ? "reported" : "unavailable"),
+    usage_is_incomplete: usageIsIncomplete,
+    cost_is_partial: costIsPartial,
+    cost_source: hasCompleteProviderCost ? "provider_reported" : "model_pricing",
+    provider_cost_usd: hasCompleteProviderCost ? providerCostUsd : null,
+    model_calls: modelCalls,
+    api_duration_ms: apiDurationMs,
+    context_tokens_used: finite(signals.contextTokensUsed),
+    context_window_tokens: finite(signals.contextWindowTokens),
+    context_usage_percent: finite(signals.contextWindowUsage),
+    tool_calls: finite(signals.toolCallCount),
+    tool_failures: finite(signals.toolFailureCount),
+    error_count: finite(signals.errorCount),
+    compaction_count: finite(signals.compactionCount),
+    provenance: {
+      source: "local-session-log",
+      confidence: usageIsIncomplete ? "partial" : "observed",
+      retry_confidence: "inferred",
+      content_retained: false,
+      usage: usageEvents > 0 ? "turn_completed.usage" : "unavailable",
+      cost: hasCompleteProviderCost ? "provider_reported" : "model_pricing",
+    },
   });
 }
 
@@ -1347,6 +1367,7 @@ function resumeCommandFor(source, sessionId) {
 }
 
 function toSessionBrowserRow(row) {
+  const tokens = row.tokens && typeof row.tokens === "object" ? row.tokens : {};
   return {
     session_hash: row.session_hash,
     session_id: row.session_id || null,
@@ -1364,8 +1385,27 @@ function toSessionBrowserRow(row) {
     edit_turns: finite(row.edit_turns),
     retry_turns: finite(row.retry_turns),
     subagent_calls: finite(row.subagent_calls),
+    input_tokens: finite(tokens.input_tokens),
+    cached_input_tokens: finite(tokens.cached_input_tokens),
+    cache_creation_input_tokens: finite(tokens.cache_creation_input_tokens),
+    output_tokens: finite(tokens.output_tokens),
+    reasoning_output_tokens: finite(tokens.reasoning_output_tokens),
     total_tokens: finite(row.total_tokens),
     cost_usd: finite(row.cost_usd),
+    cost_source: row.cost_source || null,
+    usage_precision: row.usage_precision || null,
+    usage_is_incomplete: Boolean(row.usage_is_incomplete),
+    cost_is_partial: Boolean(row.cost_is_partial),
+    usage_events: finite(row.usage_events),
+    model_calls: finite(row.model_calls),
+    api_duration_ms: finite(row.api_duration_ms),
+    context_tokens_used: finite(row.context_tokens_used),
+    context_window_tokens: finite(row.context_window_tokens),
+    context_usage_percent: finite(row.context_usage_percent),
+    tool_calls: finite(row.tool_calls),
+    tool_failures: finite(row.tool_failures),
+    error_count: finite(row.error_count),
+    compaction_count: finite(row.compaction_count),
     productive: Boolean(row.productive),
     first_pass: Boolean(row.first_pass ?? row.one_shot),
     resume_command: resumeCommandFor(row.source, row.session_id),
@@ -1384,15 +1424,35 @@ function mergeSessionFragments(rows) {
     const key = row.session_hash;
     const cur = byHash.get(key);
     if (!cur) {
-      byHash.set(key, { ...row, _repr_tokens: finite(row.total_tokens) });
+      byHash.set(key, {
+        ...row,
+        tokens: row.tokens && typeof row.tokens === "object" ? { ...row.tokens } : emptyTotals(),
+        _repr_tokens: finite(row.total_tokens),
+      });
       continue;
     }
     cur.turns = finite(cur.turns) + finite(row.turns);
     cur.edit_turns = finite(cur.edit_turns) + finite(row.edit_turns);
     cur.retry_turns = finite(cur.retry_turns) + finite(row.retry_turns);
     cur.subagent_calls = finite(cur.subagent_calls) + finite(row.subagent_calls);
+    addTotals(cur.tokens, row.tokens);
     cur.total_tokens = finite(cur.total_tokens) + finite(row.total_tokens);
     cur.cost_usd = finite(cur.cost_usd) + finite(row.cost_usd);
+    cur.provider_cost_usd = finite(cur.provider_cost_usd) + finite(row.provider_cost_usd);
+    cur.usage_events = finite(cur.usage_events) + finite(row.usage_events);
+    cur.model_calls = finite(cur.model_calls) + finite(row.model_calls);
+    cur.api_duration_ms = finite(cur.api_duration_ms) + finite(row.api_duration_ms);
+    cur.tool_calls = finite(cur.tool_calls) + finite(row.tool_calls);
+    cur.tool_failures = finite(cur.tool_failures) + finite(row.tool_failures);
+    cur.error_count = finite(cur.error_count) + finite(row.error_count);
+    cur.compaction_count = finite(cur.compaction_count) + finite(row.compaction_count);
+    cur.context_tokens_used = Math.max(finite(cur.context_tokens_used), finite(row.context_tokens_used));
+    cur.context_window_tokens = Math.max(finite(cur.context_window_tokens), finite(row.context_window_tokens));
+    cur.context_usage_percent = Math.max(finite(cur.context_usage_percent), finite(row.context_usage_percent));
+    cur.usage_is_incomplete = Boolean(cur.usage_is_incomplete) || Boolean(row.usage_is_incomplete);
+    cur.cost_is_partial = Boolean(cur.cost_is_partial) || Boolean(row.cost_is_partial);
+    if (cur.usage_precision !== row.usage_precision) cur.usage_precision = "mixed";
+    if (cur.cost_source !== row.cost_source) cur.cost_source = "mixed";
     cur.productive = Boolean(cur.productive) || Boolean(row.productive);
     cur.active_ms = finite(cur.active_ms) + finite(row.active_ms);
     if (!cur.title && row.title) cur.title = row.title;

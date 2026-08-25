@@ -1026,6 +1026,8 @@ async function handleLocalApi(req, res, url) {
       modelAgg.totals.cached_input_tokens += row.cached_input_tokens || 0;
       modelAgg.totals.cache_creation_input_tokens += row.cache_creation_input_tokens || 0;
       modelAgg.totals.reasoning_output_tokens += row.reasoning_output_tokens || 0;
+      modelAgg.totals.total_cost_usd = Number(modelAgg.totals.total_cost_usd || 0)
+        + (Number(row.total_cost_usd) || 0);
     }
 
     // 转换为最终格式

@@ -25,11 +25,13 @@ test("readUsageTotals splits cache-inclusive inputTokens", () => {
     outputTokens: 50,
     totalTokens: 1050,
     cachedReadTokens: 400,
+    cacheCreationTokens: 100,
     reasoningTokens: 20,
   });
-  assert.equal(totals.input_tokens, 600);
+  assert.equal(totals.input_tokens, 500);
   assert.equal(totals.cached_input_tokens, 400);
-  assert.equal(totals.output_tokens, 50);
+  assert.equal(totals.cache_creation_input_tokens, 100);
+  assert.equal(totals.output_tokens, 30);
   assert.equal(totals.reasoning_output_tokens, 20);
   assert.equal(totals.total_tokens, 1050);
 });
@@ -101,6 +103,7 @@ test("computeGrokContextBreakdown attributes turn usage to tools like Codex", as
             outputTokens: 100,
             totalTokens: 1100,
             cachedReadTokens: 200,
+            cacheCreationTokens: 50,
             reasoningTokens: 40,
             modelUsage: {
               "grok-4.5-build": {
@@ -108,6 +111,7 @@ test("computeGrokContextBreakdown attributes turn usage to tools like Codex", as
                 outputTokens: 100,
                 totalTokens: 1100,
                 cachedReadTokens: 200,
+                cacheCreationTokens: 50,
                 reasoningTokens: 40,
               },
             },
@@ -133,9 +137,10 @@ test("computeGrokContextBreakdown attributes turn usage to tools like Codex", as
   assert.equal(result.source, "grok");
   assert.equal(result.scope, "supported");
   assert.equal(result.totals.total_tokens, 1100);
-  assert.equal(result.totals.input_tokens, 800);
+  assert.equal(result.totals.input_tokens, 750);
   assert.equal(result.totals.cached_input_tokens, 200);
-  assert.equal(result.totals.output_tokens, 100);
+  assert.equal(result.totals.cache_creation_input_tokens, 50);
+  assert.equal(result.totals.output_tokens, 60);
   assert.equal(result.totals.reasoning_output_tokens, 40);
   assert.equal(result.session_count, 1);
   assert.equal(result.message_count, 1);
@@ -149,7 +154,14 @@ test("computeGrokContextBreakdown attributes turn usage to tools like Codex", as
 
   assert.ok(result.tool_calls_breakdown.categories.length > 0);
   assert.ok(Array.isArray(result.exec_command_breakdown.by_type));
-  assert.ok(result.message_breakdown.categories.length >= 2);
+  const messages = new Map(result.message_breakdown.categories.map((row) => [row.key, row]));
+  assert.equal(messages.get("conversation_history").totals.cache_creation_input_tokens, 50);
+  assert.equal(messages.get("assistant_response").totals.output_tokens, 60);
+  assert.equal(messages.get("reasoning").totals.reasoning_output_tokens, 40);
+  assert.equal(
+    result.message_breakdown.categories.reduce((sum, row) => sum + row.totals.total_tokens, 0),
+    result.totals.total_tokens,
+  );
 });
 
 test("computeGrokContextBreakdown returns empty supported payload without sessions", async () => {

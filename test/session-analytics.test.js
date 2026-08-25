@@ -558,6 +558,18 @@ test("Grok session analytics bills from turn_completed.usage and keeps titles lo
     sessionId,
     cwd: "/work/myproject",
     title: "Refactor the auth module",
+    signals: {
+      turnCount: 1,
+      primaryModelId: "grok-4.6",
+      modelsUsed: ["grok-4.6"],
+      contextTokensUsed: 31_445,
+      contextWindowTokens: 500_000,
+      contextWindowUsage: 6,
+      toolCallCount: 2,
+      toolFailureCount: 0,
+      errorCount: 1,
+      compactionCount: 0,
+    },
     updates: [
       grokUpdate(sessionId, "user_message_chunk", {
         content: { type: "text", text: secret },
@@ -578,14 +590,22 @@ test("Grok session analytics bills from turn_completed.usage and keeps titles lo
           outputTokens: 20,
           totalTokens: 120,
           cachedReadTokens: 10,
+          cacheCreationTokens: 10,
           reasoningTokens: 5,
+          modelCalls: 7,
+          apiDurationMs: 55_909,
+          costUsdTicks: 1_304_860_000,
           modelUsage: {
-            "grok-4.5-build-free": {
+            "grok-4.6": {
               inputTokens: 100,
               outputTokens: 20,
               totalTokens: 120,
               cachedReadTokens: 10,
+              cacheCreationTokens: 10,
               reasoningTokens: 5,
+              modelCalls: 7,
+              apiDurationMs: 55_909,
+              costUsdTicks: 1_304_860_000,
             },
           },
         },
@@ -605,14 +625,20 @@ test("Grok session analytics bills from turn_completed.usage and keeps titles lo
   assert.equal(session.one_shot, true);
   assert.equal(session.subagent_calls, 1);
   assert.equal(session.subagent_types.spawn_subagent, 1);
-  // Grok inputTokens is cache-inclusive: non-cached input = 100 - 10 = 90.
-  // Prefer reported totalTokens (120), never input+cached+output (would be 130).
+  // Grok inputTokens is cache-inclusive, and outputTokens includes reasoning.
+  // All stored columns are mutually exclusive and still sum to totalTokens.
   assert.equal(session.total_tokens, 120);
-  assert.equal(session.tokens.input_tokens, 90);
+  assert.equal(session.tokens.input_tokens, 80);
   assert.equal(session.tokens.cached_input_tokens, 10);
-  assert.equal(session.tokens.output_tokens, 20);
+  assert.equal(session.tokens.cache_creation_input_tokens, 10);
+  assert.equal(session.tokens.output_tokens, 15);
   assert.equal(session.tokens.reasoning_output_tokens, 5);
-  assert.equal(session.model, "grok-4.5-build-free");
+  assert.equal(session.model, "grok-4.6");
+  assert.equal(session.cost_usd, 0.130486);
+  assert.equal(session.cost_source, "provider_reported");
+  assert.equal(session.usage_precision, "reported");
+  assert.equal(session.model_calls, 7);
+  assert.equal(session.api_duration_ms, 55_909);
   // Prompt body never lands in the metadata row.
   assert.equal(JSON.stringify(session).includes(secret), false);
 
@@ -625,6 +651,12 @@ test("Grok session analytics bills from turn_completed.usage and keeps titles lo
   assert.equal(browser.sessions.length, 1);
   assert.equal(browser.sessions[0].title, "Refactor the auth module");
   assert.equal(browser.sessions[0].resume_command, `grok --resume ${sessionId}`);
+  assert.equal(browser.sessions[0].cache_creation_input_tokens, 10);
+  assert.equal(browser.sessions[0].reasoning_output_tokens, 5);
+  assert.equal(browser.sessions[0].cost_source, "provider_reported");
+  assert.equal(browser.sessions[0].context_tokens_used, 31_445);
+  assert.equal(browser.sessions[0].context_window_tokens, 500_000);
+  assert.equal(browser.sessions[0].error_count, 1);
 });
 
 test("Grok session analytics counts repeated prompts as retries across turns", async () => {

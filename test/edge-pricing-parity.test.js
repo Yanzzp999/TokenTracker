@@ -116,3 +116,16 @@ test("all cloud cost paths keep Pi Copilot subscription rows at zero cost", () =
     }
   }
 });
+
+test("all cloud cost paths prefer provider-reported costs when available", () => {
+  for (const name of [CANONICAL, ...MIRRORS]) {
+    const source = readEdge(name);
+    assert.ok(source.includes("total_cost_usd"), `${name}: reported cost field missing`);
+    assert.ok(source.includes("reportedCost"), `${name}: reported cost branch missing`);
+    assert.match(
+      source,
+      /Number\.isFinite\(reportedCost\) && reportedCost > 0/,
+      `${name}: positive reported cost must win over model pricing`,
+    );
+  }
+});

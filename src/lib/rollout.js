@@ -15,6 +15,7 @@ const {
   createUsageDeltaState,
   snapshotUsageBaselines,
 } = require("./codex-token-usage");
+const { USD_TICKS_PER_USD, normalizeGrokUsage } = require("./grok-usage");
 
 const DEFAULT_SOURCE = "codex";
 const DEFAULT_MODEL = "unknown";
@@ -2840,6 +2841,7 @@ async function enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets })
             reasoning_output_tokens: zeroTotals.reasoning_output_tokens,
             total_tokens: zeroTotals.total_tokens,
             billable_total_tokens: zeroTotals.billable_total_tokens,
+            total_cost_usd: zeroTotals.total_cost_usd,
             conversation_count: zeroTotals.conversation_count,
           }),
         );
@@ -2858,10 +2860,12 @@ async function enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets })
               hour_start: group.hourStart,
               input_tokens: zeroTotals.input_tokens,
               cached_input_tokens: zeroTotals.cached_input_tokens,
+              cache_creation_input_tokens: zeroTotals.cache_creation_input_tokens,
               output_tokens: zeroTotals.output_tokens,
               reasoning_output_tokens: zeroTotals.reasoning_output_tokens,
               total_tokens: zeroTotals.total_tokens,
               billable_total_tokens: zeroTotals.billable_total_tokens,
+              total_cost_usd: zeroTotals.total_cost_usd,
               conversation_count: zeroTotals.conversation_count,
             }),
           );
@@ -2876,7 +2880,8 @@ async function enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets })
           totals = cloneTotals(bucket.totals);
           addTotals(totals, unknownBucket.totals);
         }
-        const key = totalsKey(totals);
+        const usagePrecision = bucket.usage_precision || null;
+        const key = usagePrecision ? `${totalsKey(totals)}|${usagePrecision}` : totalsKey(totals);
         if (bucket.queuedKey === key) continue;
         toAppend.push(
           JSON.stringify({
@@ -2890,6 +2895,8 @@ async function enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets })
             reasoning_output_tokens: totals.reasoning_output_tokens,
             total_tokens: totals.total_tokens,
             billable_total_tokens: totals.billable_total_tokens ?? totals.total_tokens,
+            total_cost_usd: totals.total_cost_usd || 0,
+            usage_precision: usagePrecision || undefined,
             conversation_count: totals.conversation_count,
           }),
         );
@@ -2913,10 +2920,12 @@ async function enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets })
           hour_start: group.hourStart,
           input_tokens: zeroTotals.input_tokens,
           cached_input_tokens: zeroTotals.cached_input_tokens,
+          cache_creation_input_tokens: zeroTotals.cache_creation_input_tokens,
           output_tokens: zeroTotals.output_tokens,
           reasoning_output_tokens: zeroTotals.reasoning_output_tokens,
           total_tokens: zeroTotals.total_tokens,
           billable_total_tokens: zeroTotals.billable_total_tokens,
+          total_cost_usd: zeroTotals.total_cost_usd,
           conversation_count: zeroTotals.conversation_count,
         }),
       );
@@ -2940,6 +2949,7 @@ async function enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets })
             reasoning_output_tokens: zeroTotals.reasoning_output_tokens,
             total_tokens: zeroTotals.total_tokens,
             billable_total_tokens: zeroTotals.billable_total_tokens,
+            total_cost_usd: zeroTotals.total_cost_usd,
             conversation_count: zeroTotals.conversation_count,
           }),
         );
@@ -2947,7 +2957,10 @@ async function enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets })
       }
     }
     if (unknownBucket) unknownBucket.alignedModel = nextAligned;
-    const key = totalsKey(unknownBucket.totals);
+    const usagePrecision = unknownBucket.usage_precision || null;
+    const key = usagePrecision
+      ? `${totalsKey(unknownBucket.totals)}|${usagePrecision}`
+      : totalsKey(unknownBucket.totals);
     const outputKey = outputModel === DEFAULT_MODEL ? key : `${key}|${outputModel}`;
     if (unknownBucket.queuedKey === outputKey) continue;
     toAppend.push(
@@ -2962,6 +2975,8 @@ async function enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets })
         reasoning_output_tokens: unknownBucket.totals.reasoning_output_tokens,
         total_tokens: unknownBucket.totals.total_tokens,
         billable_total_tokens: unknownBucket.totals.billable_total_tokens ?? unknownBucket.totals.total_tokens,
+        total_cost_usd: unknownBucket.totals.total_cost_usd || 0,
+        usage_precision: usagePrecision || undefined,
         conversation_count: unknownBucket.totals.conversation_count,
       }),
     );
@@ -3009,6 +3024,7 @@ async function enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets })
           reasoning_output_tokens: group.totals.reasoning_output_tokens,
           total_tokens: group.totals.total_tokens,
           billable_total_tokens: group.totals.billable_total_tokens ?? group.totals.total_tokens,
+          total_cost_usd: group.totals.total_cost_usd || 0,
           conversation_count: group.totals.conversation_count,
         }),
       );
@@ -3064,6 +3080,7 @@ async function enqueueTouchedProjectBuckets({
         reasoning_output_tokens: totals.reasoning_output_tokens,
         total_tokens: totals.total_tokens,
         billable_total_tokens: totals.billable_total_tokens ?? totals.total_tokens,
+        total_cost_usd: totals.total_cost_usd || 0,
         conversation_count: totals.conversation_count,
       }),
     );
@@ -3487,6 +3504,7 @@ function initTotals() {
     reasoning_output_tokens: 0,
     total_tokens: 0,
     billable_total_tokens: 0,
+    total_cost_usd: 0,
     conversation_count: 0,
   };
 }
@@ -3499,6 +3517,9 @@ function addTotals(target, delta) {
   target.reasoning_output_tokens += delta.reasoning_output_tokens || 0;
   target.total_tokens += delta.total_tokens || 0;
   target.billable_total_tokens += delta.billable_total_tokens ?? delta.total_tokens ?? 0;
+  target.total_cost_usd = Math.round(
+    ((target.total_cost_usd || 0) + (delta.total_cost_usd || 0)) * USD_TICKS_PER_USD,
+  ) / USD_TICKS_PER_USD;
   target.conversation_count += delta.conversation_count || 0;
 }
 
@@ -3523,6 +3544,12 @@ function subtractTotals(target, totals) {
     target.billable_total_tokens -
       (totals.billable_total_tokens ?? totals.total_tokens ?? 0),
   );
+  target.total_cost_usd = Math.max(
+    0,
+    Math.round(
+      ((target.total_cost_usd || 0) - (totals.total_cost_usd || 0)) * USD_TICKS_PER_USD,
+    ) / USD_TICKS_PER_USD,
+  );
   target.conversation_count = Math.max(
     0,
     target.conversation_count - (totals.conversation_count || 0),
@@ -3538,6 +3565,7 @@ function totalsKey(totals) {
     totals.reasoning_output_tokens || 0,
     totals.total_tokens || 0,
     totals.billable_total_tokens ?? totals.total_tokens ?? 0,
+    totals.total_cost_usd || 0,
     totals.conversation_count || 0,
   ].join("|");
 }
@@ -15165,14 +15193,14 @@ async function parseCopilotAppDbIncremental({
 // ─────────────────────────────────────────────────────────────────────────────
 // Grok Build (xAI) — passive reader for ~/.grok/sessions/**/updates.jsonl + signals.json
 // Triggered either by full scan in sync or by the SessionEnd hook writing a signal.
-// updates.jsonl exposes cumulative totalTokens metadata. Grok still does not
-// expose a stable prompt/output/cache split locally, so these rows keep the
-// estimated input/output split while using better local telemetry for totals.
+// turn_completed.usage exposes the reported input/output/cache/reasoning split
+// and, on current Grok builds, exact server cost ticks. Older/partial sessions
+// without that event retain the explicitly isolated context-watermark fallback.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const GROK_ESTIMATED_INPUT_RATIO = 0.8;
-// v4: bill from turn_completed.usage (true cumulative API usage), not context-window totalTokens.
-const GROK_CURSOR_VERSION = 4;
+// v5: split cache creation + reasoning correctly and retain reported cost.
+const GROK_CURSOR_VERSION = 5;
 
 function resolveGrokBuildHome(env = process.env) {
   if (env.TOKENTRACKER_GROK_HOME) return env.TOKENTRACKER_GROK_HOME;
@@ -15415,37 +15443,13 @@ function canonicalizeGrokUsageModel(model) {
 }
 
 function normalizeGrokTurnUsage(usage, model, timestamp, eventId) {
-  if (!usage || typeof usage !== "object") return null;
-  const inputRaw = normalizeNonNegativeNumber(
-    usage.inputTokens ?? usage.input_tokens,
-  );
-  const output = normalizeNonNegativeNumber(
-    usage.outputTokens ?? usage.output_tokens,
-  );
-  const cached = normalizeNonNegativeNumber(
-    usage.cachedReadTokens ??
-      usage.cache_read_input_tokens ??
-      usage.cached_input_tokens,
-  );
-  const reasoning = normalizeNonNegativeNumber(
-    usage.reasoningTokens ?? usage.reasoning_output_tokens,
-  );
-  // Grok reports inputTokens as the full prompt (including cache hits). Split
-  // so pricing can apply cache_read rates correctly.
-  const nonCachedInput = Math.max(0, inputRaw - cached);
-  let total = normalizeNonNegativeNumber(usage.totalTokens ?? usage.total_tokens);
-  if (total <= 0) {
-    total = inputRaw + output + reasoning;
-  }
-  if (total <= 0 && nonCachedInput <= 0 && cached <= 0 && output <= 0) return null;
+  const normalized = normalizeGrokUsage(usage);
+  if (!normalized) return null;
   return {
-    input_tokens: nonCachedInput,
-    cached_input_tokens: cached,
-    cache_creation_input_tokens: 0,
-    output_tokens: output,
-    reasoning_output_tokens: reasoning,
-    total_tokens: total > 0 ? total : nonCachedInput + cached + output + reasoning,
-    billable_total_tokens: total > 0 ? total : nonCachedInput + cached + output + reasoning,
+    ...normalized,
+    // A missing/partial cost must fall back to model pricing, not turn into a
+    // falsely precise $0 row in the hourly queue.
+    total_cost_usd: normalized.total_cost_usd ?? 0,
     conversation_count: 1,
     model: canonicalizeGrokUsageModel(model),
     timestamp,
@@ -15609,6 +15613,12 @@ function estimateGrokTokenDelta(totalTokens, conversationCount, options = {}) {
   };
 }
 
+function mergeGrokUsagePrecision(current, next) {
+  if (!current) return next;
+  if (!next || current === next) return current;
+  return "mixed";
+}
+
 function clearGrokHourlyBuckets(hourlyState) {
   if (!hourlyState || typeof hourlyState !== "object") return;
   const buckets = hourlyState.buckets && typeof hourlyState.buckets === "object" ? hourlyState.buckets : null;
@@ -15686,9 +15696,9 @@ async function parseGrokBuildIncremental({
   const prevVersion = Number(grokState.version) || 0;
   const needsTurnUsageMigration = prevVersion < GROK_CURSOR_VERSION;
 
-  // v3 and earlier treated context-window totalTokens as cumulative spend, which
-  // undercounts heavily (often 10-50x) and mis-splits input/output. Rebuild from
-  // turn_completed.usage when migrating to v4.
+  // v3 and earlier treated context-window totalTokens as cumulative spend;
+  // v4 still overlapped output/reasoning, discarded cache creation, and ignored
+  // provider-reported cost. Rebuild from turn_completed.usage for v5.
   //
   // Drop prior watermark totals / updateOffsets so files are re-read from byte 0,
   // but keep legacySeen markers from seenSessions so the one-shot baseline
@@ -15793,9 +15803,10 @@ async function parseGrokBuildIncremental({
         reasoning_output_tokens: event.reasoning_output_tokens,
         total_tokens: event.total_tokens,
         billable_total_tokens: event.billable_total_tokens,
+        total_cost_usd: event.total_cost_usd,
         conversation_count: event.conversation_count || 1,
       };
-      pendingBucketDeltas.push({ model: eventModel, hourStartStr, delta });
+      pendingBucketDeltas.push({ model: eventModel, hourStartStr, delta, usagePrecision: "reported" });
       cumulativeTotal += event.total_tokens;
       tokenDeltaForSession += event.total_tokens;
       finalTouchedHourStart = hourStartStr;
@@ -15822,7 +15833,7 @@ async function parseGrokBuildIncremental({
           toUtcHalfHourStart(Date.now());
         if (!hourStartStr) continue;
         const delta = estimateGrokTokenDelta(deltaTokens, 0, { allowZeroConversationCount: true });
-        pendingBucketDeltas.push({ model, hourStartStr, delta });
+        pendingBucketDeltas.push({ model, hourStartStr, delta, usagePrecision: "estimated" });
         tokenDeltaForSession += deltaTokens;
         finalTouchedHourStart = hourStartStr;
         source = "updates";
@@ -15835,7 +15846,7 @@ async function parseGrokBuildIncremental({
         const hourStartStr = toUtcHalfHourStart(lastActive) || toUtcHalfHourStart(Date.now());
         if (hourStartStr) {
           const delta = estimateGrokTokenDelta(deltaTokens, 0, { allowZeroConversationCount: true });
-          pendingBucketDeltas.push({ model, hourStartStr, delta });
+          pendingBucketDeltas.push({ model, hourStartStr, delta, usagePrecision: "estimated" });
           tokenDeltaForSession += deltaTokens;
           finalTouchedHourStart = hourStartStr;
           source = "signals";
@@ -15853,6 +15864,10 @@ async function parseGrokBuildIncremental({
       for (const pending of pendingBucketDeltas) {
         const bucket = getHourlyBucket(hourlyState, "grok", pending.model, pending.hourStartStr);
         addTotals(bucket.totals, pending.delta);
+        bucket.usage_precision = mergeGrokUsagePrecision(
+          bucket.usage_precision,
+          pending.usagePrecision,
+        );
         touchedBuckets.add(bucketKey("grok", pending.model, pending.hourStartStr));
         eventsAggregated++;
       }
@@ -15923,7 +15938,7 @@ async function parseGrokBuildIncremental({
     ? { ...grokState.migrations }
     : {};
   if (needsTurnUsageMigration) {
-    migrations.turnUsageV4 = {
+    migrations.turnUsageV5 = {
       appliedAt: new Date().toISOString(),
       fromVersion: prevVersion,
       toVersion: GROK_CURSOR_VERSION,

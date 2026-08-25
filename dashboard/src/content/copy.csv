@@ -1383,7 +1383,7 @@ sessions.card.context_tooltip,dashboard,DashboardPage,SessionInsightsCard,contex
 sessions.card.privacy,dashboard,DashboardPage,SessionInsightsCard,privacy,"Local metadata only. Prompt, response, command output, and diff contents are never retained.",,active
 sessions.card.subagents,dashboard,DashboardPage,SessionInsightsCard,subagents,"Subagent dispatches",,active
 sessions.card.subagent_item,dashboard,DashboardPage,SessionInsightsCard,subagent_item,"{{name}} · {{calls}}",,active
-sessions.page.subtitle,ui,SessionsPage,SessionsPage,subtitle,"Browse your local Claude Code and Codex sessions and copy a resume command in one click.",,active
+sessions.page.subtitle,ui,SessionsPage,SessionsPage,subtitle,"Browse your local Claude Code, Codex, and Grok sessions and copy a resume command in one click.",,active
 sessions.page.refresh,ui,SessionsPage,SessionsPage,refresh,"Refresh sessions",,active
 sessions.filter.source_all,ui,SessionsPage,SessionsPage,filter_source_all,"All",,active
 sessions.filter.source_aria,ui,SessionsPage,SessionsPage,filter_source_aria,"Filter by session source",,active
@@ -1405,6 +1405,12 @@ sessions.col.tokens,ui,SessionsPage,SessionsPage,col_tokens,"Tokens",,active
 sessions.col.cost,ui,SessionsPage,SessionsPage,col_cost,"Cost",,active
 sessions.col.edits,ui,SessionsPage,SessionsPage,col_edits,"Edits",,active
 sessions.badge.first_pass,ui,SessionsPage,SessionsPage,badge_first_pass,"First-pass",,active
+sessions.badge.reported_cost,ui,SessionsPage,SessionsPage,badge_reported_cost,"Reported cost",,active
+sessions.badge.reported_usage,ui,SessionsPage,SessionsPage,badge_reported_usage,"Reported usage",,active
+sessions.badge.partial_usage,ui,SessionsPage,SessionsPage,badge_partial_usage,"Partial usage",,active
+sessions.grok.token_breakdown,ui,SessionsPage,SessionsPage,grok_token_breakdown,"Input {{input}} · Cache read {{cacheRead}} · Cache write {{cacheWrite}} · Output {{output}} · Reasoning {{reasoning}}",,active
+sessions.grok.runtime_breakdown,ui,SessionsPage,SessionsPage,grok_runtime_breakdown,"Model calls {{calls}} · API {{seconds}}s · Tools {{tools}} · Errors {{errors}}",,active
+sessions.grok.context_breakdown,ui,SessionsPage,SessionsPage,grok_context_breakdown,"Context {{used}} / {{window}} ({{percent}}%)",,active
 sessions.duration.minutes,ui,SessionsPage,SessionsPage,duration_minutes,"{{minutes}}m",,active
 sessions.duration.hours,ui,SessionsPage,SessionsPage,duration_hours,"{{hours}}h {{minutes}}m",,active
 sessions.project.unknown,ui,SessionsPage,SessionsPage,project_unknown,"Untitled session",,active
@@ -1415,7 +1421,7 @@ sessions.resume.copied,ui,SessionsPage,SessionsPage,resume_copied,"Resume comman
 sessions.resume.copy_failed,ui,SessionsPage,SessionsPage,resume_copy_failed,"Could not copy command",,active
 sessions.resume.unavailable,ui,SessionsPage,SessionsPage,resume_unavailable,"Resume command unavailable",,active
 sessions.empty.title,ui,SessionsPage,SessionsPage,empty_title,"No sessions yet",,active
-sessions.empty.body,ui,SessionsPage,SessionsPage,empty_body,"Run Claude Code or Codex on this machine and your sessions will show up here.",,active
+sessions.empty.body,ui,SessionsPage,SessionsPage,empty_body,"Run Claude Code, Codex, or Grok on this machine and your sessions will show up here.",,active
 sessions.empty.filtered_title,ui,SessionsPage,SessionsPage,empty_filtered_title,"No matching sessions",,active
 sessions.empty.filtered_body,ui,SessionsPage,SessionsPage,empty_filtered_body,"Try a different search, or widen the date range.",,active
 sessions.col.turns,ui,SessionsPage,SessionsPage,col_turns,"Turns",,active

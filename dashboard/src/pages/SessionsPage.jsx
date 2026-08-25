@@ -117,6 +117,31 @@ const SessionRow = React.memo(function SessionRow({ session, locale }) {
   const projectLabel = session.project_key || copy("sessions.project.unknown");
   const title = session.title || projectLabel;
   const showProjectInMeta = Boolean(session.title && session.project_key);
+  const isGrok = String(session.source || "").toLowerCase() === "grok";
+  const grokTokenBreakdown = isGrok && session.usage_precision
+    ? copy("sessions.grok.token_breakdown", {
+        input: formatCompactNumber(session.input_tokens),
+        cacheRead: formatCompactNumber(session.cached_input_tokens),
+        cacheWrite: formatCompactNumber(session.cache_creation_input_tokens),
+        output: formatCompactNumber(session.output_tokens),
+        reasoning: formatCompactNumber(session.reasoning_output_tokens),
+      })
+    : null;
+  const grokRuntimeBreakdown = isGrok && session.usage_precision
+    ? copy("sessions.grok.runtime_breakdown", {
+        calls: formatCompactNumber(session.model_calls),
+        seconds: (Number(session.api_duration_ms || 0) / 1000).toFixed(1),
+        tools: formatCompactNumber(session.tool_calls),
+        errors: formatCompactNumber(session.error_count),
+      })
+    : null;
+  const grokContextBreakdown = isGrok && Number(session.context_window_tokens) > 0
+    ? copy("sessions.grok.context_breakdown", {
+        used: formatCompactNumber(session.context_tokens_used),
+        window: formatCompactNumber(session.context_window_tokens),
+        percent: Number(session.context_usage_percent || 0).toFixed(0),
+      })
+    : null;
 
   // The resume command only works from the session's own directory, so the full
   // local path has to stay reachable. Hover reveals it, click copies it — that
@@ -194,6 +219,20 @@ const SessionRow = React.memo(function SessionRow({ session, locale }) {
                 {copy("sessions.badge.first_pass")}
               </span>
             ) : null}
+            {isGrok && session.usage_precision ? (
+              <span className={cn(
+                "inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium",
+                session.usage_is_incomplete || session.cost_is_partial
+                  ? "bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300"
+                  : "bg-sky-50 text-sky-700 dark:bg-sky-500/10 dark:text-sky-300",
+              )}>
+                {session.usage_is_incomplete || session.cost_is_partial
+                  ? copy("sessions.badge.partial_usage")
+                  : session.cost_source === "provider_reported"
+                    ? copy("sessions.badge.reported_cost")
+                    : copy("sessions.badge.reported_usage")}
+              </span>
+            ) : null}
           </div>
           <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-oai-gray-500 dark:text-oai-gray-400">
             {showProjectInMeta ? (
@@ -216,6 +255,22 @@ const SessionRow = React.memo(function SessionRow({ session, locale }) {
               </>
             ) : null}
           </div>
+          {grokTokenBreakdown ? (
+            <div className="mt-1 text-[11px] tabular-nums text-oai-gray-500 dark:text-oai-gray-400">
+              {grokTokenBreakdown}
+            </div>
+          ) : null}
+          {grokRuntimeBreakdown ? (
+            <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-[11px] tabular-nums text-oai-gray-400 dark:text-oai-gray-500">
+              <span>{grokRuntimeBreakdown}</span>
+              {grokContextBreakdown ? (
+                <>
+                  <span aria-hidden>·</span>
+                  <span>{grokContextBreakdown}</span>
+                </>
+              ) : null}
+            </div>
+          ) : null}
         </div>
       </div>
 

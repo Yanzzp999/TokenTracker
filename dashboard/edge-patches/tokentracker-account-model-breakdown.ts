@@ -392,6 +392,7 @@ interface GroupedRow {
   cached_input_tokens: number | null;
   cache_creation_input_tokens: number | null;
   reasoning_output_tokens: number | null;
+  total_cost_usd?: number | null;
   conversations: number | null;
 }
 
@@ -574,6 +575,9 @@ export default async function (req: Request): Promise<Response> {
     ma.totals.cached_input_tokens += Number(row.cached_input_tokens) || 0;
     ma.totals.cache_creation_input_tokens += Number(row.cache_creation_input_tokens) || 0;
     ma.totals.reasoning_output_tokens += Number(row.reasoning_output_tokens) || 0;
+    ma.totals.total_cost_usd = String(
+      Number(ma.totals.total_cost_usd || 0) + (Number(row.total_cost_usd) || 0),
+    );
   }
 
   const sources = Array.from(bySource.values()).map((s) => {
@@ -593,14 +597,17 @@ export default async function (req: Request): Promise<Response> {
         // convention), so charging reasoning again double-counts. Mirror the
         // guard in src/lib/pricing/index.js + tokentracker-leaderboard-refresh.ts.
         const reasoningIncludedInOutput = s.source === "codex" || s.source === "every-code";
+        const reportedCost = Number(m.totals.total_cost_usd);
         const cost = subscriptionBacked
           ? 0
-          : ((m.totals.input_tokens || 0) * (p.input || 0) +
-            (m.totals.output_tokens || 0) * (p.output || 0) +
-            (m.totals.cached_input_tokens || 0) * (p.cache_read || 0) +
-            (m.totals.cache_creation_input_tokens || 0) * ((p.cache_write ?? 0)) +
-            (reasoningIncludedInOutput ? 0 : (m.totals.reasoning_output_tokens || 0) * (p.output || 0))) /
-            1_000_000;
+          : Number.isFinite(reportedCost) && reportedCost > 0
+            ? reportedCost
+            : ((m.totals.input_tokens || 0) * (p.input || 0) +
+              (m.totals.output_tokens || 0) * (p.output || 0) +
+              (m.totals.cached_input_tokens || 0) * (p.cache_read || 0) +
+              (m.totals.cache_creation_input_tokens || 0) * ((p.cache_write ?? 0)) +
+              (reasoningIncludedInOutput ? 0 : (m.totals.reasoning_output_tokens || 0) * (p.output || 0))) /
+              1_000_000;
         return {
           model: m.model,
           model_id: m.model_id,

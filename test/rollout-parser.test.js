@@ -10427,7 +10427,7 @@ test("parseGrokBuildIncremental reads Grok updates metadata by event timestamp",
     assert.equal(queued[1].input_tokens, 120);
     assert.equal(queued[1].output_tokens, 30);
     assert.equal(queued[1].conversation_count, 2);
-    assert.equal(cursors.grok.version, 4);
+    assert.equal(cursors.grok.version, 5);
     assert.equal(cursors.grok.sessionSnapshots["grok-session-updates"].totalTokens, 250);
     assert.equal(cursors.grok.sessionSnapshots["grok-session-updates"].source, "updates");
     assert.equal(cursors.grok.sessionSnapshots["grok-session-updates"].lastEventId, "evt-2");
@@ -10703,7 +10703,7 @@ test("parseGrokBuildIncremental preserves zero current context after compaction"
   }
 });
 
-test("parseGrokBuildIncremental upgrades pre-v4 Grok cursor by rebuilding from updates", async () => {
+test("parseGrokBuildIncremental upgrades legacy Grok cursor by rebuilding from updates", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-grok-v2-cursor-"));
   try {
     const queuePath = path.join(tmp, "queue.jsonl");
@@ -10712,7 +10712,7 @@ test("parseGrokBuildIncremental upgrades pre-v4 Grok cursor by rebuilding from u
       files: {},
       updatedAt: null,
       grok: {
-        // Pre-v4 cursors used context-window watermarks. Migrating to v4 must
+        // Legacy cursors used context-window watermarks. Migrating must
         // rebuild from disk (turn_completed when present; otherwise context
         // fallback) rather than keep the old undercount forever.
         version: 2,
@@ -10761,7 +10761,7 @@ test("parseGrokBuildIncremental upgrades pre-v4 Grok cursor by rebuilding from u
       queuePath,
     });
     assert.ok(firstRun.eventsAggregated >= 1);
-    assert.equal(cursors.grok.version, 4);
+    assert.equal(cursors.grok.version, 5);
     assert.equal(cursors.grok.sessionSnapshots["grok-session-v2"].totalTokens, 250);
 
     // Second sync must not double-count the rebuilt totals.

@@ -158,3 +158,35 @@ test("usage-model-breakdown prices Grok rows produced by the parser", async () =
     await fs.promises.rm(tmp, { recursive: true, force: true });
   }
 });
+
+test("usage-model-breakdown preserves provider-reported Grok cost", async () => {
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "tt-localapi-grok-reported-cost-"));
+  try {
+    const queuePath = path.join(tmp, "queue.jsonl");
+    await writeQueue(queuePath, [{
+      source: "grok",
+      model: "grok-4.6",
+      hour_start: "2026-08-25T02:30:00.000Z",
+      input_tokens: 8_586,
+      cached_input_tokens: 192_896,
+      cache_creation_input_tokens: 0,
+      output_tokens: 1_391,
+      reasoning_output_tokens: 1_420,
+      total_tokens: 204_293,
+      billable_total_tokens: 204_293,
+      total_cost_usd: 0.130486,
+      conversation_count: 2,
+    }]);
+
+    const body = await callEndpoint(
+      queuePath,
+      "/functions/tokentracker-usage-model-breakdown?from=2026-08-25&to=2026-08-25&tz=UTC",
+    );
+    const grok = body.sources.find((entry) => entry.source === "grok");
+    assert.ok(grok);
+    assert.equal(grok.totals.total_cost_usd, "0.130486");
+    assert.equal(grok.models[0].totals.total_cost_usd, "0.130486");
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
+});

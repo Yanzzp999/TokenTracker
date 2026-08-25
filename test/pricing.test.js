@@ -850,6 +850,20 @@ test("index: computeRowCost on non-Codex source DOES bill reasoning tokens", asy
   assert.ok(w > wo, "reasoning must be billed for non-Codex sources");
 });
 
+test("index: computeRowCost prefers a provider-reported Grok cost", () => {
+  const cost = pricing.computeRowCost({
+    source: "grok",
+    model: "grok-4.6",
+    input_tokens: 8_586,
+    cached_input_tokens: 192_896,
+    cache_creation_input_tokens: 0,
+    output_tokens: 1_391,
+    reasoning_output_tokens: 1_420,
+    total_cost_usd: 0.130486,
+  });
+  assert.equal(cost, 0.130486);
+});
+
 test("index: Pi GitHub Copilot rows keep token usage but have zero estimated API cost", () => {
   pricing.resetPricingForTests();
   const row = {
