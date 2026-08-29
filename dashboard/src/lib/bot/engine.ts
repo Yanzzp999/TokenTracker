@@ -118,6 +118,7 @@ function blendPose(a: Pose, b: Pose, t: number): Pose {
     dotsBehind: t < 0.5 ? a.dotsBehind : b.dotsBehind
   }
 }
+
 /**
  * Moteur sans horloge : `sample(t)` est une fonction pure du temps.
  *
@@ -554,3 +555,4 @@ export class BotEngine {
     }
   }
 }
+

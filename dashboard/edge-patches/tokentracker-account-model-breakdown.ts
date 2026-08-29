@@ -4,6 +4,8 @@
  */
 import { createClient } from "npm:@insforge/sdk";
 
+const SOURCES_WITH_AUTHORITATIVE_COST = new Set(["grok"]);
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, OPTIONS",
@@ -612,7 +614,9 @@ export default async function (req: Request): Promise<Response> {
     const reportedCost = Number(row.total_cost_usd);
     ma.totalCostUsd += subscriptionBacked
       ? 0
-      : Number.isFinite(reportedCost) && reportedCost > 0
+      : SOURCES_WITH_AUTHORITATIVE_COST.has(src) &&
+          Number.isFinite(reportedCost) &&
+          reportedCost > 0
         ? reportedCost
       : ((Number(row.input_tokens) || 0) * (p.input || 0) +
         (Number(row.output_tokens) || 0) * (p.output || 0) +

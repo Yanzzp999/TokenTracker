@@ -19,3 +19,4 @@ export const PROFILES = {
 } as const
 
 export type ProfileName = keyof typeof PROFILES
+

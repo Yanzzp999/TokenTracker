@@ -21,6 +21,7 @@ const PI_SUBSCRIPTION_SOURCES = new Set([
   "prime-agent-github-copilot",
   "prime-agent-copilot",
 ]);
+const SOURCES_WITH_AUTHORITATIVE_COST = new Set(["grok"]);
 const SEED_SNAPSHOT_PATH = path.resolve(__dirname, "seed-snapshot.json");
 const DEEPSEEK_TIME_PRICED_MODELS = [
   "deepseek-v4-flash",
@@ -176,7 +177,11 @@ function computeRowCost(row) {
   // the usage bucket. Prefer it when positive; zero remains the legacy
   // "unreported" sentinel and falls through to model pricing.
   const reportedCost = Number(row?.total_cost_usd);
-  if (Number.isFinite(reportedCost) && reportedCost > 0) return reportedCost;
+  if (
+    SOURCES_WITH_AUTHORITATIVE_COST.has(row?.source) &&
+    Number.isFinite(reportedCost) &&
+    reportedCost > 0
+  ) return reportedCost;
   const pricing = getRowPricing(row);
   const reasoningIncludedInOutput = row.source === "codex" || row.source === "every-code";
   const reasoningCost = reasoningIncludedInOutput

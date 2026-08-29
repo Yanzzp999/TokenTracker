@@ -958,6 +958,24 @@ test("index: computeRowCost prefers a provider-reported Grok cost", () => {
   assert.equal(cost, 0.130486);
 });
 
+test("index: computeRowCost ignores reported costs from non-authoritative sources", () => {
+  const row = {
+    source: "command-code",
+    model: "claude-sonnet-4-6",
+    input_tokens: 1_000_000,
+    cached_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+    output_tokens: 1_000_000,
+    reasoning_output_tokens: 0,
+  };
+  const estimatedCost = pricing.computeRowCost(row);
+  assert.ok(estimatedCost > 0);
+  assert.equal(
+    pricing.computeRowCost({ ...row, total_cost_usd: 999 }),
+    estimatedCost,
+  );
+});
+
 test("index: Pi GitHub Copilot rows keep token usage but have zero estimated API cost", () => {
   pricing.resetPricingForTests();
   const row = {
