@@ -26,6 +26,7 @@ struct LimitsPreferencesSnapshot: Equatable {
     let displayMode: LimitDisplayMode
     let providerOrder: [String]
     let providerVisibility: [String: Bool]
+    let showSubscriptions: Bool
     let updatedAt: Int64?
 }
 
@@ -79,6 +80,9 @@ final class LimitsSettingsStore: ObservableObject {
     /// users on existing installs see no change after upgrade.
     @Published private(set) var displayMode: LimitDisplayMode
 
+    /// Whether inline subscription renewal bars are shown alongside limits.
+    @Published private(set) var showSubscriptions: Bool
+
     /// Millisecond Unix timestamp for the last user-authored preference change.
     @Published private(set) var updatedAt: Int64?
 
@@ -92,6 +96,7 @@ final class LimitsSettingsStore: ObservableObject {
     private static let orderKey = "LimitsProviderOrder"
     private static let visibilityKey = "LimitsProviderVisibility"
     private static let displayModeKey = "LimitsDisplayMode"
+    private static let showSubscriptionsKey = "LimitsShowSubscriptions"
     private static let updatedAtKey = "LimitsPreferencesUpdatedAt"
     private let userDefaults: UserDefaults
 
@@ -105,6 +110,7 @@ final class LimitsSettingsStore: ObservableObject {
         self.providerOrder = Self.normalizeProviderOrder(savedOrder)
         self.providerVisibility = Self.normalizeProviderVisibility(savedVis)
         self.displayMode = Self.readDisplayMode(from: userDefaults)
+        self.showSubscriptions = Self.readShowSubscriptions(from: userDefaults)
         self.updatedAt = Self.readUpdatedAt(from: userDefaults)
 
         save()
@@ -122,6 +128,21 @@ final class LimitsSettingsStore: ObservableObject {
         parseUpdatedAt(userDefaults.object(forKey: updatedAtKey))
     }
 
+    private static func readShowSubscriptions(from userDefaults: UserDefaults) -> Bool {
+        guard userDefaults.object(forKey: showSubscriptionsKey) != nil else {
+            return true
+        }
+        return userDefaults.bool(forKey: showSubscriptionsKey)
+    }
+
+    private static func normalizeShowSubscriptions(_ raw: Any?) -> Bool {
+        guard let number = raw as? NSNumber,
+              CFGetTypeID(number) == CFBooleanGetTypeID() else {
+            return true
+        }
+        return number.boolValue
+    }
+
     // MARK: - Helpers
 
     var limitsPreferencesPayload: [String: Any] {
@@ -129,6 +150,7 @@ final class LimitsSettingsStore: ObservableObject {
             "displayMode": displayMode.bridgeKey,
             "providerOrder": providerOrder,
             "providerVisibility": providerVisibility,
+            "showSubscriptions": showSubscriptions,
             "updatedAt": updatedAt.map { NSNumber(value: $0) } ?? NSNull(),
         ]
     }
@@ -159,6 +181,7 @@ final class LimitsSettingsStore: ObservableObject {
             displayMode: mode,
             providerOrder: providerOrder,
             providerVisibility: providerVisibility,
+            showSubscriptions: showSubscriptions,
             updatedAt: nextLocalUpdatedAt()
         ), notifyBridge: true)
     }
@@ -171,6 +194,7 @@ final class LimitsSettingsStore: ObservableObject {
             displayMode: displayMode,
             providerOrder: providerOrder,
             providerVisibility: Self.normalizeProviderVisibility(updated),
+            showSubscriptions: showSubscriptions,
             updatedAt: nextLocalUpdatedAt()
         ), notifyBridge: true)
     }
@@ -183,6 +207,18 @@ final class LimitsSettingsStore: ObservableObject {
             displayMode: displayMode,
             providerOrder: normalized,
             providerVisibility: providerVisibility,
+            showSubscriptions: showSubscriptions,
+            updatedAt: nextLocalUpdatedAt()
+        ), notifyBridge: true)
+    }
+
+    func setShowSubscriptionsFromMenu(_ show: Bool) {
+        guard show != showSubscriptions else { return }
+        applySnapshot(LimitsPreferencesSnapshot(
+            displayMode: displayMode,
+            providerOrder: providerOrder,
+            providerVisibility: providerVisibility,
+            showSubscriptions: show,
             updatedAt: nextLocalUpdatedAt()
         ), notifyBridge: true)
     }
@@ -209,6 +245,7 @@ final class LimitsSettingsStore: ObservableObject {
             displayMode: Self.normalizeDisplayMode(raw["displayMode"]),
             providerOrder: Self.normalizeProviderOrder(Self.rawProviderOrder(raw["providerOrder"])),
             providerVisibility: Self.normalizeProviderVisibility(raw["providerVisibility"] as? [String: Any]),
+            showSubscriptions: Self.normalizeShowSubscriptions(raw["showSubscriptions"]),
             updatedAt: Self.parseUpdatedAt(raw["updatedAt"])
         )
         guard shouldApplyBridgeSnapshot(snapshot) else {
@@ -230,6 +267,7 @@ final class LimitsSettingsStore: ObservableObject {
             displayMode: mode,
             providerOrder: providerOrder,
             providerVisibility: providerVisibility,
+            showSubscriptions: showSubscriptions,
             updatedAt: nil
         ), notifyBridge: false)
     }
@@ -240,11 +278,13 @@ final class LimitsSettingsStore: ObservableObject {
             displayMode: snapshot.displayMode,
             providerOrder: Self.normalizeProviderOrder(snapshot.providerOrder),
             providerVisibility: Self.normalizeProviderVisibility(snapshot.providerVisibility),
+            showSubscriptions: snapshot.showSubscriptions,
             updatedAt: snapshot.updatedAt
         )
         guard normalized.displayMode != displayMode ||
             normalized.providerOrder != providerOrder ||
             normalized.providerVisibility != providerVisibility ||
+            normalized.showSubscriptions != showSubscriptions ||
             normalized.updatedAt != updatedAt else {
             return false
         }
@@ -252,6 +292,7 @@ final class LimitsSettingsStore: ObservableObject {
         providerOrder = normalized.providerOrder
         providerVisibility = normalized.providerVisibility
         displayMode = normalized.displayMode
+        showSubscriptions = normalized.showSubscriptions
         updatedAt = normalized.updatedAt
         save()
 
@@ -381,6 +422,7 @@ final class LimitsSettingsStore: ObservableObject {
         userDefaults.set(providerOrder, forKey: Self.orderKey)
         userDefaults.set(providerVisibility, forKey: Self.visibilityKey)
         userDefaults.set(displayMode.rawValue, forKey: Self.displayModeKey)
+        userDefaults.set(showSubscriptions, forKey: Self.showSubscriptionsKey)
         if let updatedAt {
             userDefaults.set(updatedAt, forKey: Self.updatedAtKey)
         } else {

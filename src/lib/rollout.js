@@ -25,6 +25,26 @@ const CLAUDE_MEM_OBSERVER_PROJECT_REF =
   "https://local.tokentracker/claude-mem/observer-sessions";
 const PROJECT_ABSENT_CONTEXT_RESCAN_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_CODEX_COLD_SKIP_RECENT_DAYS = 2;
+const FILE_METADATA_CONCURRENCY = 32;
+
+async function mapConcurrent(items, concurrency, mapper) {
+  if (!Array.isArray(items) || items.length === 0) return [];
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(
+    items.length,
+    Math.max(1, Math.floor(Number(concurrency) || 1)),
+  );
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
 
 async function listRolloutFiles(sessionsDir, options = {}) {
   const out = [];
@@ -42,23 +62,37 @@ async function listRolloutFiles(sessionsDir, options = {}) {
       dayInventoryCache.days = {};
     }
   }
-  const years = await safeReadDir(sessionsDir);
-  for (const y of years) {
-    if (!/^[0-9]{4}$/.test(y.name) || !y.isDirectory()) continue;
-    const yearDir = path.join(sessionsDir, y.name);
-    const months = await safeReadDir(yearDir);
-    for (const m of months) {
-      if (!/^[0-9]{2}$/.test(m.name) || !m.isDirectory()) continue;
-      const monthDir = path.join(yearDir, m.name);
+  const years = (await safeReadDir(sessionsDir))
+    .filter((entry) => /^[0-9]{4}$/.test(entry.name) && entry.isDirectory());
+  const monthGroups = await mapConcurrent(
+    years,
+    FILE_METADATA_CONCURRENCY,
+    async (year) => {
+      const yearDir = path.join(sessionsDir, year.name);
+      const months = await safeReadDir(yearDir);
+      return months
+        .filter((entry) => /^[0-9]{2}$/.test(entry.name) && entry.isDirectory())
+        .map((entry) => path.join(yearDir, entry.name));
+    },
+  );
+  const monthDirs = monthGroups.flat();
+  const dayGroups = await mapConcurrent(
+    monthDirs,
+    FILE_METADATA_CONCURRENCY,
+    async (monthDir) => {
       const days = await safeReadDir(monthDir);
-      for (const d of days) {
-        if (!/^[0-9]{2}$/.test(d.name) || !d.isDirectory()) continue;
-        const dayDir = path.join(monthDir, d.name);
-        const files = await listRolloutDayFiles(dayDir, { dayInventoryCache, stats });
-        out.push(...files);
-      }
-    }
-  }
+      return days
+        .filter((entry) => /^[0-9]{2}$/.test(entry.name) && entry.isDirectory())
+        .map((entry) => path.join(monthDir, entry.name));
+    },
+  );
+  const dayDirs = dayGroups.flat();
+  const fileGroups = await mapConcurrent(
+    dayDirs,
+    FILE_METADATA_CONCURRENCY,
+    (dayDir) => listRolloutDayFiles(dayDir, { dayInventoryCache, stats }),
+  );
+  for (const files of fileGroups) out.push(...files);
 
   out.sort((a, b) => a.localeCompare(b));
   return out;
@@ -355,6 +389,18 @@ async function parseRolloutIncremental({
     return false;
   };
 
+  // Metadata reads are independent while parsing and bucket mutation are not.
+  // Prefetch stats with bounded concurrency, then retain the original stable
+  // file order for parsing, deduplication, cursor updates, and queue writes.
+  const rolloutStats = await mapConcurrent(
+    rolloutFiles,
+    FILE_METADATA_CONCURRENCY,
+    async (entry) => {
+      const filePath = typeof entry === "string" ? entry : entry?.path;
+      if (!filePath) return null;
+      return fs.stat(filePath).catch(() => null);
+    },
+  );
   for (let idx = 0; idx < rolloutFiles.length; idx++) {
     const entry = rolloutFiles[idx];
     const filePath = typeof entry === "string" ? entry : entry?.path;
@@ -364,7 +410,7 @@ async function parseRolloutIncremental({
         ? defaultSource
         : normalizeSourceInput(entry?.source) || defaultSource;
     if (syncDiagnostics && fileSource === DEFAULT_SOURCE) syncDiagnostics.stat_candidates += 1;
-    const st = await fs.stat(filePath).catch(() => null);
+    const st = rolloutStats[idx];
     if (!st || !st.isFile()) continue;
 
     const key = filePath;
@@ -2699,7 +2745,8 @@ async function parseOpencodeMessageFile({
     };
   }
 
-  const model = normalizeModelInput(msg?.modelID || msg?.model || msg?.modelId) || DEFAULT_MODEL;
+  const { modelId: fileModelId } = normalizeOpencodeModelFields(msg);
+  const model = fileModelId || DEFAULT_MODEL;
   const bucket = getHourlyBucket(hourlyState, source, model, bucketStart);
   addTotals(bucket.totals, delta);
   touchedBuckets.add(bucketKey(source, model, bucketStart));
@@ -3255,6 +3302,7 @@ function normalizeOpencodeState(raw) {
   const messages = state.messages && typeof state.messages === "object" ? state.messages : {};
   return {
     messages,
+    dbCursor: state.dbCursor && typeof state.dbCursor === "object" ? state.dbCursor : null,
     updatedAt: typeof state.updatedAt === "string" ? state.updatedAt : null,
   };
 }
@@ -3306,8 +3354,11 @@ function deriveOpencodeMessageFingerprint({ msg, totals, source }) {
   const created = coerceEpochMs(msg?.time?.created) || 0;
   const completed = coerceEpochMs(msg?.time?.completed) || 0;
   if (!created && !completed) return null;
-  const model = normalizeModelInput(msg?.modelID || msg?.model || msg?.modelId) || DEFAULT_MODEL;
-  const provider = normalizeMessageKeyPart(msg?.providerID || msg?.provider || msg?.providerId);
+  // v1 keeps flat modelID/providerID strings; v2 nests them in
+  // `model: { id, providerID }` — normalize both (see normalizeOpencodeModelFields).
+  const { modelId, providerId } = normalizeOpencodeModelFields(msg);
+  const model = modelId || DEFAULT_MODEL;
+  const provider = providerId;
   const raw = [
     normalizeSourceInput(source) || "opencode",
     created,
@@ -3329,13 +3380,20 @@ function deriveOpencodeMessageFingerprint({ msg, totals, source }) {
 // Rebuilt per parse run. Pre-#426 entries are fingerprinted as they are read;
 // the first claims ownership and later cross-session matches are retracted from
 // persisted buckets once. Tombstoned copies never claim ownership themselves.
-function buildOpencodeFingerprintIndex(messageIndex) {
+function buildOpencodeFingerprintIndex(messageIndex, wantedFingerprints = null) {
   const byFingerprint = new Map();
   if (!messageIndex || typeof messageIndex !== "object") return byFingerprint;
-  for (const [key, entry] of Object.entries(messageIndex)) {
+  for (const key in messageIndex) {
+    const entry = messageIndex[key];
     if (entry?.dedupedForkCopy === true) continue;
     const fingerprint = entry && typeof entry.fingerprint === "string" ? entry.fingerprint : null;
-    if (fingerprint && !byFingerprint.has(fingerprint)) byFingerprint.set(fingerprint, key);
+    if (
+      fingerprint &&
+      (!wantedFingerprints || wantedFingerprints.has(fingerprint)) &&
+      !byFingerprint.has(fingerprint)
+    ) {
+      byFingerprint.set(fingerprint, key);
+    }
   }
   return byFingerprint;
 }
@@ -3360,6 +3418,52 @@ function isOpencodeForkCopy(fingerprintIndex, fingerprint, messageKey) {
   return ownerSession !== session;
 }
 
+function normalizeOpencodeAttribution(raw) {
+  if (typeof raw === "string") {
+    const [bucketStart = "", model = "", projectKey = "", projectRef = ""] = raw.split("\t");
+    if (!bucketStart || !model) return null;
+    return {
+      bucketStart,
+      model,
+      projectKey: projectKey || null,
+      projectRef: projectRef || null,
+    };
+  }
+  if (!raw || typeof raw !== "object") return null;
+  const bucketStart = typeof raw.bucketStart === "string" ? raw.bucketStart : "";
+  const model = typeof raw.model === "string" ? raw.model : "";
+  if (!bucketStart || !model) return null;
+  return {
+    bucketStart,
+    model,
+    projectKey: typeof raw.projectKey === "string" ? raw.projectKey : null,
+    projectRef: typeof raw.projectRef === "string" ? raw.projectRef : null,
+  };
+}
+
+function encodeOpencodeAttribution(raw) {
+  const attribution = normalizeOpencodeAttribution(raw);
+  if (!attribution) return null;
+  return [
+    attribution.bucketStart,
+    attribution.model,
+    attribution.projectKey || "",
+    attribution.projectRef || "",
+  ].join("\t");
+}
+
+function sameOpencodeAttribution(a, b) {
+  const left = normalizeOpencodeAttribution(a);
+  const right = normalizeOpencodeAttribution(b);
+  if (!left || !right) return left === right;
+  return (
+    left.bucketStart === right.bucketStart &&
+    left.model === right.model &&
+    left.projectKey === right.projectKey &&
+    left.projectRef === right.projectRef
+  );
+}
+
 // Persist a message's snapshot + fingerprint and claim the fingerprint for it.
 // Writes only when something actually changed so a steady-state sync leaves the
 // cursor untouched. A falsy `fingerprint` means "unknown" and preserves whatever
@@ -3371,6 +3475,7 @@ function recordOpencodeMessage({
   messageKey,
   totals,
   fingerprint,
+  attribution,
   dedupedForkCopy = false,
 }) {
   if (!messageIndex || !messageKey) return;
@@ -3378,10 +3483,13 @@ function recordOpencodeMessage({
   const prevTotals = prev && typeof prev.lastTotals === "object" ? prev.lastTotals : null;
   const prevFingerprint = prev && typeof prev.fingerprint === "string" ? prev.fingerprint : null;
   const nextFingerprint = fingerprint || prevFingerprint;
+  const prevAttribution = normalizeOpencodeAttribution(prev?.attribution);
+  const nextAttribution = normalizeOpencodeAttribution(attribution) || prevAttribution;
   const prevDeduped = prev?.dedupedForkCopy === true;
   if (
     sameGeminiTotals(totals, prevTotals) &&
     prevFingerprint === nextFingerprint &&
+    sameOpencodeAttribution(prevAttribution, nextAttribution) &&
     prevDeduped === Boolean(dedupedForkCopy)
   ) return;
 
@@ -3392,6 +3500,7 @@ function recordOpencodeMessage({
   }
   const entry = { lastTotals: totals, updatedAt: new Date().toISOString() };
   if (nextFingerprint) entry.fingerprint = nextFingerprint;
+  if (nextAttribution) entry.attribution = encodeOpencodeAttribution(nextAttribution);
   if (dedupedForkCopy) entry.dedupedForkCopy = true;
   messageIndex[messageKey] = entry;
   if (
@@ -3404,8 +3513,45 @@ function recordOpencodeMessage({
   }
 }
 
+function subtractCountedOpencodeMessage({
+  attribution,
+  totals,
+  source,
+  hourlyState,
+  touchedBuckets,
+  projectState,
+  projectTouchedBuckets,
+}) {
+  const countedAt = normalizeOpencodeAttribution(attribution);
+  if (!countedAt) return false;
+  const counted = { ...totals, conversation_count: 1 };
+  const bucket = getHourlyBucket(
+    hourlyState,
+    source,
+    countedAt.model,
+    countedAt.bucketStart,
+  );
+  subtractTotals(bucket.totals, counted);
+  touchedBuckets.add(bucketKey(source, countedAt.model, countedAt.bucketStart));
+  if (countedAt.projectKey && projectState && projectTouchedBuckets) {
+    const projectBucket = getProjectBucket(
+      projectState,
+      countedAt.projectKey,
+      source,
+      countedAt.bucketStart,
+      countedAt.projectRef,
+    );
+    subtractTotals(projectBucket.totals, counted);
+    projectTouchedBuckets.add(
+      projectBucketKey(countedAt.projectKey, source, countedAt.bucketStart),
+    );
+  }
+  return true;
+}
+
 function repairCountedOpencodeForkCopy({
   msg,
+  attribution,
   totals,
   source,
   hourlyState,
@@ -3415,27 +3561,29 @@ function repairCountedOpencodeForkCopy({
   projectRef,
   projectKey,
 }) {
-  const timestampMs = coerceEpochMs(msg?.time?.completed) || coerceEpochMs(msg?.time?.created);
-  if (!timestampMs) return false;
-  const bucketStart = toUtcHalfHourStart(new Date(timestampMs).toISOString());
-  if (!bucketStart) return false;
-  const model = normalizeModelInput(msg?.modelID || msg?.model || msg?.modelId) || DEFAULT_MODEL;
-  const counted = { ...totals, conversation_count: 1 };
-  const bucket = getHourlyBucket(hourlyState, source, model, bucketStart);
-  subtractTotals(bucket.totals, counted);
-  touchedBuckets.add(bucketKey(source, model, bucketStart));
-  if (projectKey && projectState && projectTouchedBuckets) {
-    const projectBucket = getProjectBucket(
-      projectState,
-      projectKey,
-      source,
+  let countedAt = normalizeOpencodeAttribution(attribution);
+  if (!countedAt) {
+    const timestampMs = coerceEpochMs(msg?.time?.completed) || coerceEpochMs(msg?.time?.created);
+    if (!timestampMs) return false;
+    const bucketStart = toUtcHalfHourStart(new Date(timestampMs).toISOString());
+    if (!bucketStart) return false;
+    const { modelId: repairModelId } = normalizeOpencodeModelFields(msg);
+    countedAt = {
       bucketStart,
+      model: repairModelId || DEFAULT_MODEL,
+      projectKey,
       projectRef,
-    );
-    subtractTotals(projectBucket.totals, counted);
-    projectTouchedBuckets.add(projectBucketKey(projectKey, source, bucketStart));
+    };
   }
-  return true;
+  return subtractCountedOpencodeMessage({
+    attribution: countedAt,
+    totals,
+    source,
+    hourlyState,
+    touchedBuckets,
+    projectState,
+    projectTouchedBuckets,
+  });
 }
 
 function getHourlyBucket(state, source, model, hourStart) {
@@ -3661,6 +3809,33 @@ function normalizeModelInput(value) {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+// OpenCode v1 stores the model as flat strings on every assistant message
+// (`modelID`, `providerID`), while OpenCode v2 (the `opencode2` beta, which
+// moved messages into the `session_message` table) nests them inside a single
+// object: `model: { id, providerID, variant }`. Some forks also wrote a plain
+// string into `model`. Resolve both shapes to { modelId, providerId } so
+// bucket keys and fork fingerprints stay identical across versions.
+function normalizeOpencodeModelFields(msg) {
+  const directModel =
+    normalizeModelInput(msg?.modelID) ||
+    normalizeModelInput(typeof msg?.model === "string" ? msg.model : null) ||
+    normalizeModelInput(msg?.modelId);
+  if (directModel) {
+    return {
+      modelId: directModel,
+      providerId: normalizeMessageKeyPart(msg?.providerID || msg?.provider || msg?.providerId),
+    };
+  }
+  const nested = msg?.model;
+  if (nested && typeof nested === "object") {
+    return {
+      modelId: normalizeModelInput(nested.id),
+      providerId: normalizeMessageKeyPart(nested.providerID),
+    };
+  }
+  return { modelId: null, providerId: "" };
 }
 
 async function resolveProjectMetaForPath(startDir, cache) {
@@ -4135,10 +4310,6 @@ function diffGeminiTotals(current, previous) {
   const totalReset = (current.total_tokens || 0) < (previous.total_tokens || 0);
   if (totalReset) return current;
 
-  // Must include cache_creation_input_tokens in both the equality check and
-  // the delta — OpenCode routes through this diff and its cache.write number
-  // would otherwise be permanently reported as zero. Gemini itself always
-  // emits cache_creation=0 so the extra field is a no-op for Gemini.
   const delta = {
     input_tokens: Math.max(0, (current.input_tokens || 0) - (previous.input_tokens || 0)),
     cached_input_tokens: Math.max(
@@ -4157,6 +4328,29 @@ function diffGeminiTotals(current, previous) {
     total_tokens: Math.max(0, (current.total_tokens || 0) - (previous.total_tokens || 0)),
   };
 
+  return isAllZeroUsage(delta) ? null : delta;
+}
+
+// OpenCode rows are authoritative snapshots of one message and can be
+// corrected downward or move tokens between cache/output columns. Signed
+// deltas replace the prior contribution instead of treating a correction as a
+// fresh cumulative reset. Gemini keeps its provider-specific reset behavior.
+function diffOpencodeTotals(current, previous) {
+  if (!current || typeof current !== "object") return null;
+  if (!previous || typeof previous !== "object") return current;
+  if (sameGeminiTotals(current, previous)) return null;
+
+  const delta = {};
+  for (const key of [
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_creation_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+  ]) {
+    delta[key] = Number(current[key] || 0) - Number(previous[key] || 0);
+  }
   return isAllZeroUsage(delta) ? null : delta;
 }
 
@@ -4326,12 +4520,143 @@ async function walkOpencodeMessages(dir, out) {
 }
 
 // ---------------------------------------------------------------------------
-// OpenCode SQLite DB reader (v1.2+ stores messages in opencode.db)
+// OpenCode SQLite DB reader
+//
+// Four real database shapes exist in the wild (see PR #501 / opencode2):
+//   A  pure v1:        `message`(data) + `session_message`(empty) [+ `session`]
+//   B  beta-17887:     `session_message`(data) + `session_v2`
+//   C  upstream v2:    `session_message`(data) + `session`
+//   D  transitional:   `message`(old data) + `session_message`(new data)
+//
+// The reader must serve all four without firing a doomed SQL at type A (an
+// empty `session_message` table still EXISTS — querying it with a JOIN against
+// `session_v2` that does not exist throws "no such table" every sync, and the
+// old code silently swallowed that error). The combined probe below answers
+// both "is there v2 data?" and "which session table exists?" in one round-trip.
 // ---------------------------------------------------------------------------
 
-function readOpencodeDbMessages(dbPath, sqliteOptions = {}) {
-  if (!dbPath || !fssync.existsSync(dbPath)) return [];
-  const sql = `SELECT id, session_id, time_updated, data FROM message WHERE json_extract(data, '$.role') = 'assistant' ORDER BY time_created ASC`;
+const OPENCODE_DB_CURSOR_VERSION = 1;
+
+function normalizeOpencodeDbWatermark(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const maxRowId = Math.max(0, Math.floor(Number(raw.maxRowId) || 0));
+  const maxUpdatedAt = Math.max(0, Math.floor(Number(raw.maxUpdatedAt) || 0));
+  const anchor = typeof raw.anchor === "string" && raw.anchor ? raw.anchor : null;
+  return maxRowId || maxUpdatedAt ? { maxRowId, maxUpdatedAt, anchor } : null;
+}
+
+function opencodeDbIdentity(dbPath) {
+  try {
+    const stat = fssync.statSync(dbPath);
+    const resolved = path.resolve(dbPath);
+    return {
+      pathHash: crypto.createHash("sha256").update(resolved).digest("hex"),
+      dev: String(stat.dev || 0),
+      ino: String(stat.ino || 0),
+    };
+  } catch (_e) {
+    return null;
+  }
+}
+
+function sameOpencodeDbIdentity(a, b) {
+  return Boolean(
+    a &&
+    b &&
+    a.pathHash === b.pathHash &&
+    a.dev === b.dev &&
+    a.ino === b.ino,
+  );
+}
+
+function opencodeDbRowAnchor(row) {
+  if (!row || typeof row !== "object") return null;
+  const rowId = Math.max(0, Math.floor(Number(row.row_id) || 0));
+  const id = typeof row.id === "string" ? row.id : "";
+  const created = Math.max(0, Math.floor(Number(row.time_created) || 0));
+  if (!rowId || !id) return null;
+  return crypto.createHash("sha256").update(`${rowId}\0${id}\0${created}`).digest("base64url");
+}
+
+function opencodeDbIncrementalPredicate(alias, watermark) {
+  const cursor = normalizeOpencodeDbWatermark(watermark);
+  if (!cursor) return "";
+  const clauses = [];
+  if (cursor.maxRowId) clauses.push(`${alias}rowid > ${cursor.maxRowId}`);
+  // Re-read the boundary timestamp so simultaneous updates cannot fall through
+  // a strict greater-than watermark. The duplicate is removed by messageIndex.
+  if (cursor.maxUpdatedAt) clauses.push(`${alias}time_updated >= ${cursor.maxUpdatedAt}`);
+  return clauses.length > 0 ? ` AND (${clauses.join(" OR ")})` : "";
+}
+
+function buildV1Sql(watermark = null) {
+  return (
+    `SELECT rowid AS row_id, id, session_id, time_updated, data FROM message ` +
+    `WHERE json_extract(data, '$.role') = 'assistant'` +
+    `${opencodeDbIncrementalPredicate("", watermark)} ORDER BY time_created ASC`
+  );
+}
+
+// Build the v2 query. When a session table exists the LEFT JOIN restores the
+// project directory for downstream attribution; when it does not (type B
+// without session_v2, or an exotic fork) the join and directory column are
+// omitted and tokens are counted as-is.
+function buildV2Sql(sessionTable, watermark = null) {
+  const joinClause = sessionTable
+    ? `LEFT JOIN ${sessionTable} s ON s.id = sm.session_id `
+    : "";
+  const directorySelect = sessionTable
+    ? `s.directory AS directory, `
+    : "";
+  return (
+    `SELECT sm.rowid AS row_id, sm.id AS id, sm.session_id AS session_id, sm.time_updated AS time_updated, ` +
+    `${directorySelect}sm.data AS data ` +
+    `FROM session_message sm ${joinClause}` +
+    `WHERE sm.type = 'assistant'` +
+    `${opencodeDbIncrementalPredicate("sm.", watermark)} ORDER BY sm.time_created ASC`
+  );
+}
+
+// One combined probe: hasRows (is there any data in session_message?) plus
+// sessionTable (which session table exists, session_v2 preferred over session
+// via DESC). Returns null when the probe itself fails — callers treat that as
+// v1-only, matching the pre-existing silent-degradation contract.
+function detectOpencodeMessageLayout(dbPath, sqliteOptions = {}) {
+  let rows;
+  try {
+    rows = readSqliteJsonRows(
+      dbPath,
+      `SELECT (SELECT 1 FROM session_message LIMIT 1) AS hasRows,
+              (SELECT name FROM sqlite_master WHERE name IN ('session','session_v2') ORDER BY name DESC LIMIT 1) AS sessionTable`,
+      { label: "OpenCode", timeout: 10_000, maxBuffer: 1024 * 1024, ...sqliteOptions },
+    );
+  } catch (_e) {
+    return null;
+  }
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  const row = rows[0];
+  return {
+    hasRows: Boolean(row?.hasRows),
+    sessionTable: typeof row?.sessionTable === "string" && row.sessionTable.trim()
+      ? row.sessionTable.trim()
+      : null,
+  };
+}
+
+// Shared provider resolver: v1 rows carry a top-level providerID, v2 rows nest
+// it under model.providerID. Used by the mimo/zcode discriminators so they work
+// against both generations without duplicating the resolution logic.
+function opencodeMessageProvider(data) {
+  return data?.providerID || data?.model?.providerID || "";
+}
+
+function readOpencodeDbMessagesIncremental(dbPath, previousCursor = null, sqliteOptions = {}) {
+  if (!dbPath || !fssync.existsSync(dbPath)) return { messages: [], cursor: null };
+
+  const identity = opencodeDbIdentity(dbPath);
+  const canResume =
+    previousCursor?.version === OPENCODE_DB_CURSOR_VERSION &&
+    sameOpencodeDbIdentity(previousCursor.identity, identity);
 
   let snapshot = null;
   let effectiveDbPath = dbPath;
@@ -4342,14 +4667,16 @@ function readOpencodeDbMessages(dbPath, sqliteOptions = {}) {
     } catch (_e) { }
   }
 
-  try {
-    const rows = readSqliteJsonRows(effectiveDbPath, sql, {
-      label: "OpenCode",
-      maxBuffer: 50 * 1024 * 1024,
-      timeout: 30_000,
-      ...sqliteOptions,
-    });
-    const out = [];
+  // Parse raw SQL rows into the shared { id, sessionID, timeUpdated, data }
+  // shape; optionally restore v2's session-level project directory as the
+  // per-message `path.cwd` the rest of the pipeline expects.
+  //
+  // D-state (transitional) union: both the legacy `message` table and the new
+  // `session_message` table may carry rows. Cross-table duplicates are caught
+  // by the existing cursor-key + #426 fingerprint dedup in
+  // parseOpencodeDbIncremental, so unioning here is safe — the downstream
+  // parser collapses identical sessionID|messageID pairs before bucketing.
+  const appendRows = (rows, isV2, out) => {
     for (const row of rows) {
       if (!row || typeof row.data !== "string") continue;
       let data;
@@ -4364,8 +4691,13 @@ function readOpencodeDbMessages(dbPath, sqliteOptions = {}) {
       const hasTokens =
         toNonNegativeInt(tokens.input) > 0 ||
         toNonNegativeInt(tokens.output) > 0 ||
-        toNonNegativeInt(tokens.reasoning) > 0;
+        toNonNegativeInt(tokens.reasoning) > 0 ||
+        toNonNegativeInt(tokens.cache?.read) > 0 ||
+        toNonNegativeInt(tokens.cache?.write) > 0;
       if (!hasTokens) continue;
+      if (isV2 && typeof row.directory === "string" && row.directory.trim()) {
+        data.path = { ...(typeof data.path === "object" && data.path ? data.path : {}), cwd: row.directory };
+      }
       out.push({
         id: row.id || data.id,
         sessionID: row.session_id || data.sessionID,
@@ -4373,10 +4705,138 @@ function readOpencodeDbMessages(dbPath, sqliteOptions = {}) {
         data,
       });
     }
-    return out;
+  };
+
+  const readGeneration = (sql) => {
+    try {
+      const rows = readSqliteJsonRows(effectiveDbPath, sql, {
+        label: "OpenCode",
+        maxBuffer: 50 * 1024 * 1024,
+        timeout: 30_000,
+        ...sqliteOptions,
+        throwOnReadFailure: true,
+      });
+      return Array.isArray(rows) ? rows : [];
+    } catch (_e) {
+      return null; // query-level failure (e.g. wrong generation's table)
+    }
+  };
+
+  const readMaxRowId = (table) => {
+    const rows = readGeneration(`SELECT MAX(rowid) AS max_row_id FROM ${table}`);
+    if (!rows) return null;
+    return Math.max(0, Math.floor(Number(rows[0]?.max_row_id) || 0));
+  };
+
+  const readRowAnchor = (table, rowId) => {
+    if (!rowId) return null;
+    const rows = readGeneration(
+      `SELECT rowid AS row_id, id, time_created FROM ${table} WHERE rowid = ${rowId}`,
+    );
+    return rows ? opencodeDbRowAnchor(rows[0]) : null;
+  };
+
+  const readCursorGeneration = ({ table, isV2, sql }) => {
+    const previous = canResume
+      ? normalizeOpencodeDbWatermark(previousCursor?.[isV2 ? "v2" : "v1"])
+      : null;
+    let forceReplay = false;
+    let lastRows = [];
+
+    // Each query uses a separate SQLite reader. Verify the same immutable head
+    // row before and after the data query so an in-place database replacement
+    // cannot make us persist a cursor from a generation we did not read.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const currentMaxRowId = readMaxRowId(table);
+      if (currentMaxRowId === null) return null;
+      const currentAnchor = readRowAnchor(table, currentMaxRowId);
+      const previousAnchor = previous
+        ? readRowAnchor(table, previous.maxRowId)
+        : null;
+      const watermark =
+        !forceReplay &&
+        previous?.anchor &&
+        currentMaxRowId >= previous.maxRowId &&
+        previousAnchor === previous.anchor
+          ? previous
+          : null;
+      const rows = readGeneration(sql(watermark));
+      if (!rows) return null;
+      lastRows = rows;
+
+      if (readRowAnchor(table, currentMaxRowId) !== currentAnchor) {
+        forceReplay = true;
+        continue;
+      }
+
+      let maxUpdatedAt = watermark?.maxUpdatedAt || 0;
+      for (const row of rows) {
+        maxUpdatedAt = Math.max(maxUpdatedAt, Math.floor(Number(row?.time_updated) || 0));
+      }
+      return {
+        rows,
+        // Advance only to the head whose anchor bracketed this query. Rows
+        // appended concurrently may be returned now and harmlessly reread on
+        // the next sync; advancing to them would require an unverified anchor.
+        cursor: {
+          maxRowId: currentMaxRowId,
+          maxUpdatedAt,
+          anchor: currentAnchor,
+        },
+      };
+    }
+
+    // Keep parsed usage but refuse to advance while the database is unstable.
+    return { rows: lastRows, cursor: null };
+  };
+
+  try {
+    // Combined probe drives the orchestration: v1 always runs (it is the
+    // baseline every database carries or degrades to), v2 runs only when the
+    // probe confirms session_message has rows — this avoids firing a JOIN
+    // against a non-existent session table on type-A databases.
+    const probe = detectOpencodeMessageLayout(effectiveDbPath, sqliteOptions);
+    const out = [];
+    const nextCursor = {
+      version: OPENCODE_DB_CURSOR_VERSION,
+      identity,
+      v1: null,
+      v2: null,
+    };
+
+    const v1 = readCursorGeneration({
+      table: "message",
+      isV2: false,
+      sql: buildV1Sql,
+    });
+    if (v1) {
+      appendRows(v1.rows, false, out);
+      nextCursor.v1 = v1.cursor;
+    }
+
+    if (probe?.hasRows) {
+      const v2 = readCursorGeneration({
+        table: "session_message",
+        isV2: true,
+        sql: (watermark) => buildV2Sql(probe.sessionTable, watermark),
+      });
+      if (v2) {
+        appendRows(v2.rows, true, out);
+        nextCursor.v2 = v2.cursor;
+      }
+    }
+
+    return {
+      messages: out,
+      cursor: nextCursor.v1 || nextCursor.v2 ? nextCursor : null,
+    };
   } finally {
     if (snapshot) snapshot.cleanup();
   }
+}
+
+function readOpencodeDbMessages(dbPath, sqliteOptions = {}) {
+  return readOpencodeDbMessagesIncremental(dbPath, null, sqliteOptions).messages;
 }
 
 // mimocode mirrors the user's Claude Code + claude-mem history into its own
@@ -4397,7 +4857,7 @@ function readOpencodeDbMessages(dbPath, sqliteOptions = {}) {
 // subsumes it.
 function isMimoNativeMessage(data) {
   if (!data) return false;
-  const provider = String(data.providerID || "").toLowerCase();
+  const provider = String(opencodeMessageProvider(data)).toLowerCase();
   return provider === "mimo" || provider === "xiaomi";
 }
 
@@ -4431,7 +4891,7 @@ function readMimoDbMessages(dbPath, sqliteOptions = {}) {
 // re-count it. Mirrors the Mimo discipline.
 function isZcodeNativeMessage(data) {
   if (!data) return false;
-  const provider = String(data.providerID || "").toLowerCase();
+  const provider = String(opencodeMessageProvider(data)).toLowerCase();
   if (!provider) return false;
   return !(
     provider.includes("anthropic") ||
@@ -4440,10 +4900,195 @@ function isZcodeNativeMessage(data) {
   );
 }
 
+const ZCODE_NATIVE_USAGE_COLUMNS = new Set([
+  "id",
+  "logical_request_id",
+  "attempt_index",
+  "session_id",
+  "provider_id",
+  "model_id",
+  "status",
+  "started_at",
+  "input_tokens",
+  "output_tokens",
+  "reasoning_tokens",
+  "cache_creation_input_tokens",
+  "cache_read_input_tokens",
+]);
+
+function detectZcodeNativeUsageLayout(dbPath, sqliteOptions = {}) {
+  if (!dbPath || !fssync.existsSync(dbPath)) return null;
+  let rows;
+  try {
+    rows = readSqliteJsonRows(
+      dbPath,
+      `SELECT 'model_usage' AS table_name, name FROM pragma_table_info('model_usage')
+       UNION ALL
+       SELECT 'session' AS table_name, name FROM pragma_table_info('session')`,
+      {
+        label: "ZCode",
+        timeout: 10_000,
+        maxBuffer: 1024 * 1024,
+        ...sqliteOptions,
+        throwOnReadFailure: true,
+      },
+    );
+  } catch (_error) {
+    return null;
+  }
+  const modelUsageColumns = new Set(
+    rows
+      .filter((row) => !row?.table_name || row.table_name === "model_usage")
+      .map((row) => String(row?.name || "")),
+  );
+  if (![...ZCODE_NATIVE_USAGE_COLUMNS].every((name) => modelUsageColumns.has(name))) {
+    return null;
+  }
+  const sessionColumns = new Set(
+    rows
+      .filter((row) => row?.table_name === "session")
+      .map((row) => String(row?.name || "")),
+  );
+  return {
+    hasSessionDirectory: sessionColumns.has("id") && sessionColumns.has("directory"),
+  };
+}
+
+function hasZcodeNativeUsageSchema(dbPath, sqliteOptions = {}) {
+  if (!dbPath || !fssync.existsSync(dbPath)) return false;
+  let snapshot = null;
+  let effectiveDbPath = dbPath;
+  if (isUncPath(dbPath)) {
+    try {
+      snapshot = snapshotSqliteDb(dbPath);
+      effectiveDbPath = snapshot.path;
+    } catch (_error) {
+      // Fall through to the direct read: some UNC servers support SQLite's
+      // read-only locking semantics even when the WSL bridge does not.
+    }
+  }
+  try {
+    return detectZcodeNativeUsageLayout(effectiveDbPath, sqliteOptions) !== null;
+  } finally {
+    if (snapshot) snapshot.cleanup();
+  }
+}
+
+function buildZcodeNativeUsageSql({ hasSessionDirectory }) {
+  const directorySelect = hasSessionDirectory ? ", s.directory AS directory" : "";
+  const directoryJoin = hasSessionDirectory
+    ? " LEFT JOIN session AS s ON s.id = mu.session_id"
+    : "";
+  return `SELECT
+    mu.id,
+    mu.logical_request_id,
+    mu.attempt_index,
+    mu.session_id,
+    mu.provider_id,
+    mu.model_id,
+    mu.started_at,
+    mu.input_tokens,
+    mu.output_tokens,
+    mu.reasoning_tokens,
+    mu.cache_creation_input_tokens,
+    mu.cache_read_input_tokens
+    ${directorySelect}
+    FROM model_usage AS mu${directoryJoin}
+    WHERE mu.status = 'completed'
+      AND trim(mu.model_id) != ''
+      AND (
+        mu.input_tokens > 0 OR mu.output_tokens > 0 OR mu.reasoning_tokens > 0 OR
+        mu.cache_creation_input_tokens > 0 OR mu.cache_read_input_tokens > 0
+      )
+    ORDER BY mu.started_at ASC, mu.id ASC`;
+}
+
+function readZcodeNativeUsageMessages(dbPath, sqliteOptions = {}) {
+  let snapshot = null;
+  let effectiveDbPath = dbPath;
+  if (isUncPath(dbPath)) {
+    try {
+      snapshot = snapshotSqliteDb(dbPath);
+      effectiveDbPath = snapshot.path;
+    } catch (_error) {
+      // Preserve the existing direct-read fallback for transient snapshot
+      // failures and UNC implementations that support SQLite locking.
+    }
+  }
+
+  let rows;
+  try {
+    const layout = detectZcodeNativeUsageLayout(effectiveDbPath, sqliteOptions);
+    if (!layout) return null;
+    rows = readSqliteJsonRows(effectiveDbPath, buildZcodeNativeUsageSql(layout), {
+      label: "ZCode",
+      maxBuffer: 50 * 1024 * 1024,
+      timeout: 30_000,
+      ...sqliteOptions,
+      throwOnReadFailure: true,
+    });
+  } catch (_error) {
+    return null;
+  } finally {
+    if (snapshot) snapshot.cleanup();
+  }
+
+  const messages = [];
+  for (const row of rows) {
+    const providerID = String(row?.provider_id || "").trim();
+    const modelID = String(row?.model_id || "").trim();
+    const sessionID = String(row?.session_id || "").trim();
+    const logicalRequestId = String(row?.logical_request_id || "").trim();
+    const attemptIndex = toNonNegativeInt(row?.attempt_index);
+    const id = String(row?.id || "").trim() ||
+      (logicalRequestId ? `${logicalRequestId}#${attemptIndex}` : "");
+    const startedAt = coerceEpochMs(row?.started_at);
+    if (!providerID || !modelID || !sessionID || !id || !startedAt) continue;
+
+    // ZCode's persisted input/output columns are inclusive parents:
+    // cache read/write are subsets of input, and reasoning is a subset of
+    // output. TokenTracker stores those five columns disjointly, so split the
+    // subsets here before entering the shared OpenCode parser. This preserves
+    // sum(input + cache read + cache write + output + reasoning) without
+    // billing either subset twice.
+    const rawInput = toNonNegativeInt(row?.input_tokens);
+    const rawOutput = toNonNegativeInt(row?.output_tokens);
+    const cacheRead = toNonNegativeInt(row?.cache_read_input_tokens);
+    const cacheWrite = toNonNegativeInt(row?.cache_creation_input_tokens);
+    const reasoning = toNonNegativeInt(row?.reasoning_tokens);
+
+    const data = {
+      id,
+      sessionID,
+      role: "assistant",
+      providerID,
+      modelID,
+      time: { created: startedAt, completed: startedAt },
+      tokens: {
+        input: Math.max(0, rawInput - cacheRead - cacheWrite),
+        output: Math.max(0, rawOutput - reasoning),
+        reasoning,
+        cache: {
+          read: cacheRead,
+          write: cacheWrite,
+        },
+      },
+    };
+    if (typeof row?.directory === "string" && row.directory.trim()) {
+      data.path = { cwd: row.directory.trim() };
+    }
+    if (!isZcodeNativeMessage(data)) continue;
+    messages.push({ id, sessionID, timeUpdated: startedAt, data });
+  }
+  return messages;
+}
+
 // Read only genuine ZCode assistant messages (its own GLM models via Z.ai /
 // BigModel), dropping any bundled sub-agent turns. See isZcodeNativeMessage.
 function readZcodeDbMessages(dbPath, sqliteOptions = {}) {
   if (!dbPath || !fssync.existsSync(dbPath)) return [];
+  const nativeMessages = readZcodeNativeUsageMessages(dbPath, sqliteOptions);
+  if (nativeMessages !== null) return nativeMessages;
   const all = readOpencodeDbMessages(dbPath, sqliteOptions);
   return all.filter((m) => isZcodeNativeMessage(m.data));
 }
@@ -4451,6 +5096,7 @@ function readZcodeDbMessages(dbPath, sqliteOptions = {}) {
 async function parseOpencodeDbIncremental({
   dbMessages,
   dbPath,
+  dbCursor,
   cursors,
   queuePath,
   projectQueuePath,
@@ -4475,9 +5121,20 @@ async function parseOpencodeDbIncremental({
   const cursorNamespace = typeof cursorKey === "string" && cursorKey.length > 0 ? cursorKey : "opencode";
   const opencodeState = normalizeOpencodeState(cursors?.[cursorNamespace]);
   const messageIndex = opencodeState.messages;
-  const fingerprintIndex = buildOpencodeFingerprintIndex(messageIndex);
   const touchedBuckets = new Set();
   const defaultSource = normalizeSourceInput(source) || "opencode";
+  const candidateFingerprints = new Set();
+  for (const entry of messages) {
+    const totals = normalizeOpencodeTokens(entry?.data?.tokens);
+    const fingerprint = totals
+      ? deriveOpencodeMessageFingerprint({ msg: entry.data, totals, source: defaultSource })
+      : null;
+    if (fingerprint) candidateFingerprints.add(fingerprint);
+  }
+  // A hook-triggered sync normally carries one changed row. Restrict the
+  // historical fingerprint map to fingerprints that can actually match this
+  // batch instead of duplicating the whole long-lived message index in memory.
+  const fingerprintIndex = buildOpencodeFingerprintIndex(messageIndex, candidateFingerprints);
 
   for (let idx = 0; idx < messages.length; idx++) {
     const entry = messages[idx];
@@ -4527,6 +5184,7 @@ async function parseOpencodeDbIncremental({
       if (lastTotals && prev?.dedupedForkCopy !== true) {
         repairCountedOpencodeForkCopy({
           msg,
+          attribution: prev?.attribution,
           totals: lastTotals,
           source: defaultSource,
           hourlyState,
@@ -4550,17 +5208,58 @@ async function parseOpencodeDbIncremental({
     }
 
     const effectiveLastTotals = prev?.dedupedForkCopy === true ? null : lastTotals;
-    const delta = diffGeminiTotals(currentTotals, effectiveLastTotals);
-    if (!delta || isAllZeroUsage(delta)) {
+    const delta = diffOpencodeTotals(currentTotals, effectiveLastTotals);
+    const timestampMs = coerceEpochMs(msg?.time?.completed) || coerceEpochMs(msg?.time?.created);
+    if (!timestampMs) {
+      messagesProcessed += 1;
+      continue;
+    }
+
+    const tsIso = new Date(timestampMs).toISOString();
+    const bucketStart = toUtcHalfHourStart(tsIso);
+    if (!bucketStart) {
+      messagesProcessed += 1;
+      continue;
+    }
+
+    const { modelId: dbModelId } = normalizeOpencodeModelFields(msg);
+    const model = dbModelId || DEFAULT_MODEL;
+    const projectContext = projectEnabled
+      ? await resolveProjectContextForDb({
+          msg,
+          dbPath,
+          projectMetaCache,
+          publicRepoCache,
+          publicRepoResolver,
+          projectState,
+        })
+      : null;
+    const attribution = {
+      bucketStart,
+      model,
+      projectKey: projectContext?.projectKey || null,
+      projectRef: projectContext?.projectRef || null,
+    };
+
+    const previousAttribution = effectiveLastTotals
+      ? normalizeOpencodeAttribution(prev?.attribution)
+      : null;
+    const moved = Boolean(
+      effectiveLastTotals &&
+      previousAttribution &&
+      !sameOpencodeAttribution(previousAttribution, attribution),
+    );
+    if ((!delta || isAllZeroUsage(delta)) && !moved) {
       // Refresh the index even without a delta: normalization may have changed,
-      // and pre-#426 entries need their fingerprint backfilled so a fork taken
-      // from an old session is still recognised.
+      // and pre-#426 entries need their fingerprint backfilled. Preserve an
+      // existing contribution location without bloating every legacy cursor.
       recordOpencodeMessage({
         messageIndex,
         fingerprintIndex,
         messageKey,
         totals: currentTotals,
         fingerprint,
+        attribution: prev?.attribution ? attribution : null,
         dedupedForkCopy: false,
       });
       messagesProcessed += 1;
@@ -4575,48 +5274,37 @@ async function parseOpencodeDbIncremental({
       }
       continue;
     }
-    delta.conversation_count = 1;
 
-    const timestampMs = coerceEpochMs(msg?.time?.completed) || coerceEpochMs(msg?.time?.created);
-    if (!timestampMs) {
-      messagesProcessed += 1;
-      continue;
+    if (moved) {
+      subtractCountedOpencodeMessage({
+        attribution: previousAttribution,
+        totals: effectiveLastTotals,
+        source: defaultSource,
+        hourlyState,
+        touchedBuckets,
+        projectState,
+        projectTouchedBuckets,
+      });
     }
-
-    const tsIso = new Date(timestampMs).toISOString();
-    const bucketStart = toUtcHalfHourStart(tsIso);
-    if (!bucketStart) {
-      messagesProcessed += 1;
-      continue;
-    }
-
-    const model = normalizeModelInput(msg?.modelID || msg?.model || msg?.modelId) || DEFAULT_MODEL;
+    const contribution = moved
+      ? { ...currentTotals, conversation_count: 1 }
+      : { ...delta, conversation_count: effectiveLastTotals ? 0 : 1 };
     const bucket = getHourlyBucket(hourlyState, defaultSource, model, bucketStart);
-    addTotals(bucket.totals, delta);
+    addTotals(bucket.totals, contribution);
     touchedBuckets.add(bucketKey(defaultSource, model, bucketStart));
 
-    if (projectEnabled) {
-      const projectContext = await resolveProjectContextForDb({
-        msg,
-        dbPath,
-        projectMetaCache,
-        publicRepoCache,
-        publicRepoResolver,
+    if (attribution.projectKey && projectState && projectTouchedBuckets) {
+      const projectBucket = getProjectBucket(
         projectState,
-      });
-      const projectRef = projectContext?.projectRef || null;
-      const projectKey = projectContext?.projectKey || null;
-      if (projectKey && projectState && projectTouchedBuckets) {
-        const projectBucket = getProjectBucket(
-          projectState,
-          projectKey,
-          defaultSource,
-          bucketStart,
-          projectRef,
-        );
-        addTotals(projectBucket.totals, delta);
-        projectTouchedBuckets.add(projectBucketKey(projectKey, defaultSource, bucketStart));
-      }
+        attribution.projectKey,
+        defaultSource,
+        bucketStart,
+        attribution.projectRef,
+      );
+      addTotals(projectBucket.totals, contribution);
+      projectTouchedBuckets.add(
+        projectBucketKey(attribution.projectKey, defaultSource, bucketStart),
+      );
     }
 
     recordOpencodeMessage({
@@ -4625,10 +5313,11 @@ async function parseOpencodeDbIncremental({
       messageKey,
       totals: currentTotals,
       fingerprint,
+      attribution,
       dedupedForkCopy: false,
     });
     messagesProcessed += 1;
-    eventsAggregated += 1;
+    if (delta && !isAllZeroUsage(delta)) eventsAggregated += 1;
 
     if (cb) {
       cb({
@@ -4647,6 +5336,7 @@ async function parseOpencodeDbIncremental({
     : 0;
   hourlyState.updatedAt = new Date().toISOString();
   cursors.hourly = hourlyState;
+  if (dbCursor && typeof dbCursor === "object") opencodeState.dbCursor = dbCursor;
   opencodeState.updatedAt = new Date().toISOString();
   cursors[cursorNamespace] = opencodeState;
   if (projectState) {
@@ -13201,7 +13891,7 @@ async function parseCraftIncremental({
 //   COPILOT_OTEL_ENABLED=true
 //   COPILOT_OTEL_EXPORTER_TYPE=file
 //   COPILOT_OTEL_FILE_EXPORTER_PATH=$HOME/.copilot/otel/copilot-otel-...jsonl
-// We scan the default directory plus the env-overridden path.
+// We scan both known default directories plus the env-overridden path.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function resolveCopilotOtelPaths(env = process.env) {
@@ -13216,12 +13906,19 @@ function resolveCopilotOtelPaths(env = process.env) {
     } catch (_e) {}
   };
   if (process.platform !== "win32" || wsl.shouldProbeNative(env)) {
-    scanDir(path.join(home, ".copilot", "otel"));
+    for (const dir of [
+      path.join(home, ".copilot", "otel"),
+      path.join(home, ".copilot-otel"),
+    ]) {
+      scanDir(dir);
+    }
   }
   if (process.platform === "win32") {
     if (wsl.shouldProbeWsl(env)) {
-      const wslDir = wsl.discoverWslHome(".copilot/otel", { env });
-      if (wslDir) scanDir(wslDir);
+      for (const providerDir of [".copilot/otel", ".copilot-otel"]) {
+        const wslDir = wsl.discoverWslHome(providerDir, { env });
+        if (wslDir) scanDir(wslDir);
+      }
     }
   }
   const explicit = env.COPILOT_OTEL_FILE_EXPORTER_PATH;
@@ -13263,7 +13960,7 @@ function pickCopilotModel(attrs) {
   return null;
 }
 
-const COPILOT_PARSER_VERSION = 2;
+const COPILOT_PARSER_VERSION = 3;
 const COPILOT_USAGE_CLAIM_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const COPILOT_USAGE_CLAIM_MAX_ENTRIES = 10_000;
 
@@ -13320,12 +14017,166 @@ function incrementMapCount(map, key, amount = 1) {
   map.set(key, (map.get(key) || 0) + amount);
 }
 
-function getCopilotDedupKey(record, attrs = record?.attributes || {}) {
+function getCopilotResponseId(attrs = {}) {
+  const responseId = attrs["gen_ai.response.id"];
+  return typeof responseId === "string" && responseId.trim() ? responseId.trim() : "";
+}
+
+// v2 preferred spanContext for every OTEL envelope. Chat-extension LogRecords
+// can share that nested context across several model requests, so keep the old
+// key only for the one envelope that owns top-level traceId/spanId: CLI spans.
+function getCopilotLegacyDedupKey(record, attrs = record?.attributes || {}) {
   const traceId = record?.traceId || record?.spanContext?.traceId || "";
   const spanId = record?.spanId || record?.spanContext?.spanId || "";
-  const responseId =
-    typeof attrs["gen_ai.response.id"] === "string" ? attrs["gen_ai.response.id"] : "";
+  const responseId = getCopilotResponseId(attrs);
   return traceId && spanId ? `${traceId}:${spanId}` : responseId ? `resp:${responseId}` : null;
+}
+
+function getCopilotDedupKey(record, attrs = record?.attributes || {}) {
+  const responseId = getCopilotResponseId(attrs);
+  if (!isCopilotV1ChatSpan(record)) {
+    return responseId ? `resp:${responseId}` : null;
+  }
+
+  const traceId = record?.traceId || "";
+  const spanId = record?.spanId || "";
+  return traceId && spanId
+    ? `${traceId}:${spanId}`
+    : responseId
+      ? `resp:${responseId}`
+      : null;
+}
+
+function copilotOtelAggregateKey(model, bucketStart) {
+  return JSON.stringify([model, bucketStart]);
+}
+
+function addCopilotOtelAggregate(aggregates, model, bucketStart, delta) {
+  const key = copilotOtelAggregateKey(model, bucketStart);
+  let totals = aggregates.get(key);
+  if (!totals) {
+    totals = initTotals();
+    aggregates.set(key, totals);
+  }
+  addTotals(totals, delta);
+}
+
+function copilotTotalsCover(existing, required) {
+  if (!existing || typeof existing !== "object") return false;
+  for (const field of [
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_creation_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+    "billable_total_tokens",
+    "conversation_count",
+  ]) {
+    const actual = Number(existing[field] || 0);
+    const needed = Number(required?.[field] || 0);
+    if (!Number.isFinite(actual) || !Number.isFinite(needed) || actual < needed) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function extractCopilotOtelUsage(record) {
+  if (!isCopilotChatSpan(record)) return null;
+
+  const attrs = record.attributes || {};
+  const inputRaw = toNonNegativeInt(attrs["gen_ai.usage.input_tokens"]);
+  const output = toNonNegativeInt(attrs["gen_ai.usage.output_tokens"]);
+  const cacheRead = toNonNegativeInt(
+    attrs["gen_ai.usage.cache_read.input_tokens"] ??
+      attrs["gen_ai.usage.cache_read_input_tokens"] ??
+      attrs["gen_ai.usage.cached_input_tokens"],
+  );
+  // Copilot CLI: cache_write.input_tokens; Copilot Chat extension: cache_creation.input_tokens
+  const cacheWrite = toNonNegativeInt(
+    attrs["gen_ai.usage.cache_write.input_tokens"] ??
+      attrs["gen_ai.usage.cache_creation.input_tokens"] ??
+      attrs["gen_ai.usage.cache_write_input_tokens"] ??
+      attrs["gen_ai.usage.cache_creation_input_tokens"],
+  );
+  // Copilot CLI: reasoning.output_tokens; Copilot Chat extension: reasoning_tokens
+  const reasoning = toNonNegativeInt(
+    attrs["gen_ai.usage.reasoning.output_tokens"] ??
+      attrs["gen_ai.usage.reasoning_tokens"] ??
+      attrs["gen_ai.usage.reasoning_output_tokens"],
+  );
+  const reasoningClamped = Math.min(reasoning, output);
+  const outputWithoutReasoning = Math.max(0, output - reasoningClamped);
+  const cliSpan = isCopilotV1ChatSpan(record);
+  // CLI input includes both cache reads and writes. Chat-extension LogRecords
+  // expose cache creation separately, so preserve their existing input-minus-read semantics.
+  const cacheReadClamped = Math.min(cacheRead, inputRaw);
+  const cacheWriteClamped = Math.min(
+    cacheWrite,
+    Math.max(0, inputRaw - cacheReadClamped),
+  );
+  const cacheWriteForAccounting = cliSpan ? cacheWriteClamped : cacheWrite;
+  const input = Math.max(
+    0,
+    inputRaw - cacheReadClamped - (cliSpan ? cacheWriteClamped : 0),
+  );
+  const totalInteresting =
+    input +
+    outputWithoutReasoning +
+    cacheReadClamped +
+    cacheWriteForAccounting +
+    reasoningClamped;
+  if (totalInteresting === 0) return null;
+
+  // CLI Span uses endTime/startTime; Chat extension LogRecord uses hrTime/hrTimeObserved.
+  const tsMs =
+    copilotOtelTimeToMs(record.endTime) ||
+    copilotOtelTimeToMs(record.startTime) ||
+    copilotOtelTimeToMs(record.hrTime) ||
+    copilotOtelTimeToMs(record.hrTimeObserved);
+  if (!tsMs) return null;
+  const bucketStart = toUtcHalfHourStart(new Date(tsMs).toISOString());
+  if (!bucketStart) return null;
+
+  const model =
+    normalizeCopilotAppModel(pickCopilotModel(attrs)) ||
+    COPILOT_APP_DEFAULT_MODEL;
+  const cliSessionId =
+    typeof attrs["gen_ai.conversation.id"] === "string"
+      ? attrs["gen_ai.conversation.id"].trim()
+      : "";
+  const matchBase = {
+    sessionId: cliSessionId,
+    model,
+    output: outputWithoutReasoning,
+    cacheRead: cacheReadClamped,
+    cacheWrite: cacheWriteClamped,
+    reasoning: reasoningClamped,
+    tsMs,
+  };
+  return {
+    bucketStart,
+    cliSpan,
+    cliSessionId,
+    delta: {
+      input_tokens: input,
+      cached_input_tokens: cacheReadClamped,
+      cache_creation_input_tokens: cacheWriteForAccounting,
+      output_tokens: outputWithoutReasoning,
+      reasoning_output_tokens: reasoningClamped,
+      total_tokens:
+        input +
+        outputWithoutReasoning +
+        cacheReadClamped +
+        cacheWriteForAccounting +
+        reasoningClamped,
+      conversation_count: 1,
+    },
+    matchBase,
+    model,
+    tsMs,
+  };
 }
 
 function copilotUsageMatchKey({
@@ -13385,6 +14236,141 @@ function createCopilotStoreUsageMatcher(events) {
       return true;
     },
   };
+}
+
+// v2 may already have advanced the file cursor while collapsing several Chat
+// extension LogRecords that shared one nested spanContext. Recompute only that
+// envelope's historical contribution and apply the delta to the existing
+// Copilot buckets. CLI spans are deliberately left alone: their v2 key was the
+// correct top-level traceId:spanId key, and session-store adoption can coexist
+// with the OTEL parser.
+async function migrateCopilotChatLogRecordDedup({
+  files,
+  fileOffsets,
+  hourlyState,
+  touchedBuckets,
+  seenIds,
+} = {}) {
+  const trackedFiles = Object.keys(fileOffsets || {}).filter(
+    (filePath) => Number(fileOffsets[filePath]?.size) > 0,
+  );
+  if (trackedFiles.length === 0) {
+    return { applied: true, changed: false };
+  }
+
+  const availableFiles = new Set(Array.isArray(files) ? files : []);
+  if (trackedFiles.some((filePath) => !availableFiles.has(filePath))) {
+    return { applied: false, reason: "a previously parsed OTEL file is unavailable" };
+  }
+
+  const oldSeen = new Set();
+  const newSeen = new Set();
+  const oldTotals = new Map();
+  const newTotals = new Map();
+
+  for (const filePath of files) {
+    if (!Object.prototype.hasOwnProperty.call(fileOffsets, filePath)) continue;
+    const prevEntry = fileOffsets[filePath] || {};
+    const prevSize = Number(prevEntry.size) || 0;
+    if (prevSize <= 0) continue;
+
+    let stat;
+    try {
+      stat = fssync.statSync(filePath);
+    } catch (_e) {
+      return { applied: false, reason: "a previously parsed OTEL file is unreadable" };
+    }
+    if (
+      stat.size < prevSize ||
+      (typeof prevEntry.ino === "number" && stat.ino !== prevEntry.ino)
+    ) {
+      return { applied: false, reason: "a previously parsed OTEL file changed during migration" };
+    }
+
+    let stream;
+    try {
+      stream = fssync.createReadStream(filePath, {
+        encoding: "utf8",
+        start: 0,
+        end: prevSize - 1,
+      });
+      const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+      try {
+        for await (const line of rl) {
+          if (!line || !line.trim()) continue;
+          let record;
+          try {
+            record = JSON.parse(line);
+          } catch (_e) {
+            continue;
+          }
+          const usage = extractCopilotOtelUsage(record);
+          if (!usage || usage.cliSpan) continue;
+
+          const oldKey = getCopilotLegacyDedupKey(record, record.attributes || {});
+          const oldDuplicate = oldKey && oldSeen.has(oldKey);
+          if (oldKey) oldSeen.add(oldKey);
+          if (!oldDuplicate) {
+            addCopilotOtelAggregate(
+              oldTotals,
+              usage.model,
+              usage.bucketStart,
+              usage.delta,
+            );
+          }
+
+          const newKey = getCopilotDedupKey(record, record.attributes || {});
+          const newDuplicate = newKey && newSeen.has(newKey);
+          if (newKey) newSeen.add(newKey);
+          if (!newDuplicate) {
+            addCopilotOtelAggregate(
+              newTotals,
+              usage.model,
+              usage.bucketStart,
+              usage.delta,
+            );
+          }
+        }
+      } finally {
+        rl.close();
+      }
+    } catch (_e) {
+      return { applied: false, reason: "an OTEL file could not be scanned" };
+    } finally {
+      stream?.destroy();
+    }
+  }
+
+  const keys = new Set([...oldTotals.keys(), ...newTotals.keys()]);
+  for (const key of keys) {
+    const [model, bucketStart] = JSON.parse(key);
+    const oldUsage = oldTotals.get(key) || initTotals();
+    if (!copilotTotalsCover(
+      hourlyState.buckets[bucketKey("copilot", model, bucketStart)]?.totals,
+      oldUsage,
+    )) {
+      return {
+        applied: false,
+        reason: "existing Copilot buckets do not cover the old OTEL contribution",
+      };
+    }
+  }
+
+  let changed = false;
+  for (const key of keys) {
+    const [model, bucketStart] = JSON.parse(key);
+    const oldUsage = oldTotals.get(key) || initTotals();
+    const newUsage = newTotals.get(key) || initTotals();
+    if (totalsKey(oldUsage) === totalsKey(newUsage)) continue;
+    const bucket = getHourlyBucket(hourlyState, "copilot", model, bucketStart);
+    subtractTotals(bucket.totals, oldUsage);
+    addTotals(bucket.totals, newUsage);
+    touchedBuckets.add(bucketKey("copilot", model, bucketStart));
+    changed = true;
+  }
+
+  for (const id of newSeen) seenIds.add(id);
+  return { applied: true, changed };
 }
 
 // Migration helper: stream the bytes v1 already saw (0 -> prevSize), classify
@@ -13500,12 +14486,18 @@ async function parseCopilotIncremental({
     seenIds.size > 0 || Object.keys(fileOffsetsRaw).length > 0;
   let usageClaimsComplete =
     copilotState.usageClaimsComplete === true || !hadPriorUsageHistory;
+  const files = Array.isArray(otelPaths) && otelPaths.length > 0
+    ? otelPaths
+    : resolveCopilotOtelPaths(env || process.env);
+  const hourlyState = normalizeHourlyState(cursors?.hourly);
+  const touchedBuckets = new Set();
   const migrationSkipLineHashes = new Map();
+  let cursorVersion = COPILOT_PARSER_VERSION;
   // One-shot v1->v2 migration:
   // - pure v2-only files: clear offset and re-read all skipped Chat records
   // - pure v1 CLI files: preserve offset to avoid replaying history beyond seenIds
   // - mixed files: clear offset, but skip old v1 CLI lines by hash during replay
-  if (priorVersion < COPILOT_PARSER_VERSION) {
+  if (priorVersion < 2) {
     for (const filePath of Object.keys(fileOffsets)) {
       const prevSize = Number(fileOffsets[filePath]?.size) || 0;
       const scan = await scanCopilotV1MigrationFile(filePath, prevSize);
@@ -13518,13 +14510,33 @@ async function parseCopilotIncremental({
     }
   }
 
-  const files = Array.isArray(otelPaths) && otelPaths.length > 0
-    ? otelPaths
-    : resolveCopilotOtelPaths(env || process.env);
+  // v2 used spanContext as the fallback key for Chat-extension LogRecords.
+  // Those records can share one context across multiple model requests, so
+  // repair the already-counted file prefix before switching to response.id.
+  // If the prefix cannot be verified, leave the cursor at v2 and retry on the
+  // next sync rather than replaying it with a different deduplication scheme.
+  if (priorVersion === 2) {
+    const migration = await migrateCopilotChatLogRecordDedup({
+      files,
+      fileOffsets,
+      hourlyState,
+      touchedBuckets,
+      seenIds,
+    });
+    if (!migration.applied) {
+      return {
+        recordsProcessed: 0,
+        eventsAggregated: 0,
+        bucketsQueued: 0,
+        usageClaims: recentOtelUsageEvents,
+      };
+    }
+  }
+
   if (files.length === 0) {
     cursors.copilot = {
       ...copilotState,
-      version: COPILOT_PARSER_VERSION,
+      version: cursorVersion,
       seenIds: Array.from(seenIds),
       fileOffsets,
       recentUsageEvents: recentOtelUsageEvents,
@@ -13538,9 +14550,6 @@ async function parseCopilotIncremental({
       usageClaims: recentOtelUsageEvents,
     };
   }
-
-  const hourlyState = normalizeHourlyState(cursors?.hourly);
-  const touchedBuckets = new Set();
   const cb = typeof onProgress === "function" ? onProgress : null;
   let recordsProcessed = 0;
   let eventsAggregated = 0;
@@ -13600,117 +14609,39 @@ async function parseCopilotIncremental({
       // gen_ai.response.id is per-LLM-call unique.
       const dedupKey = getCopilotDedupKey(record, attrs);
       if (dedupKey && seenIds.has(dedupKey)) continue;
-      if (skipCliSpans && isCopilotV1ChatSpan(record)) {
+      const cliSpan = isCopilotV1ChatSpan(record);
+      if (skipCliSpans && cliSpan) {
         if (dedupKey) seenIds.add(dedupKey);
         continue;
       }
 
-      const inputRaw = toNonNegativeInt(attrs["gen_ai.usage.input_tokens"]);
-      const output = toNonNegativeInt(attrs["gen_ai.usage.output_tokens"]);
-      const cacheRead = toNonNegativeInt(
-        attrs["gen_ai.usage.cache_read.input_tokens"] ??
-          attrs["gen_ai.usage.cache_read_input_tokens"] ??
-          attrs["gen_ai.usage.cached_input_tokens"],
-      );
-      // Copilot CLI: cache_write.input_tokens; Copilot Chat extension: cache_creation.input_tokens
-      const cacheWrite = toNonNegativeInt(
-        attrs["gen_ai.usage.cache_write.input_tokens"] ??
-          attrs["gen_ai.usage.cache_creation.input_tokens"] ??
-          attrs["gen_ai.usage.cache_write_input_tokens"] ??
-          attrs["gen_ai.usage.cache_creation_input_tokens"],
-      );
-      // Copilot CLI: reasoning.output_tokens; Copilot Chat extension: reasoning_tokens
-      const reasoning = toNonNegativeInt(
-        attrs["gen_ai.usage.reasoning.output_tokens"] ??
-          attrs["gen_ai.usage.reasoning_tokens"] ??
-          attrs["gen_ai.usage.reasoning_output_tokens"],
-      );
-      const reasoningClamped = Math.min(reasoning, output);
-      const outputWithoutReasoning = Math.max(0, output - reasoningClamped);
-      const cliSpan = isCopilotV1ChatSpan(record);
-      // CLI input includes both cache reads and writes. Chat-extension
-      // LogRecords expose cache creation separately, so preserve their existing
-      // input-minus-read semantics.
-      const cacheReadClamped = Math.min(cacheRead, inputRaw);
-      const cacheWriteClamped = Math.min(
-        cacheWrite,
-        Math.max(0, inputRaw - cacheReadClamped),
-      );
-      const cacheWriteForAccounting = cliSpan ? cacheWriteClamped : cacheWrite;
-      const input = Math.max(
-        0,
-        inputRaw - cacheReadClamped - (cliSpan ? cacheWriteClamped : 0),
-      );
-      const totalInteresting =
-        input +
-        outputWithoutReasoning +
-        cacheReadClamped +
-        cacheWriteForAccounting +
-        reasoningClamped;
-      if (totalInteresting === 0) continue;
-
-      // CLI Span uses endTime/startTime; Chat extension LogRecord uses hrTime/hrTimeObserved.
-      const tsMs =
-        copilotOtelTimeToMs(record.endTime) ||
-        copilotOtelTimeToMs(record.startTime) ||
-        copilotOtelTimeToMs(record.hrTime) ||
-        copilotOtelTimeToMs(record.hrTimeObserved);
-      if (!tsMs) continue;
-      const tsIso = new Date(tsMs).toISOString();
-      const bucketStart = toUtcHalfHourStart(tsIso);
-      if (!bucketStart) continue;
-
-      const model =
-        normalizeCopilotAppModel(pickCopilotModel(attrs)) ||
-        COPILOT_APP_DEFAULT_MODEL;
-      const cliSessionId =
-        typeof attrs["gen_ai.conversation.id"] === "string"
-          ? attrs["gen_ai.conversation.id"].trim()
-          : "";
-      if (cliSpan && !cliSessionId) usageClaimsComplete = false;
-      const matchBase = {
-        sessionId: cliSessionId,
-        model,
-        output: outputWithoutReasoning,
-        cacheRead: cacheReadClamped,
-        cacheWrite: cacheWriteClamped,
-        reasoning: reasoningClamped,
-        tsMs,
-      };
+      const usage = extractCopilotOtelUsage(record);
+      if (!usage) continue;
+      if (usage.cliSpan && !usage.cliSessionId) usageClaimsComplete = false;
       const matchedStoreUsage =
-        isCopilotV1ChatSpan(record) &&
+        usage.cliSpan &&
         storeUsageMatcher.consume({
-          ...matchBase,
-          input,
+          ...usage.matchBase,
+          input: usage.delta.input_tokens,
         });
       if (matchedStoreUsage) {
         if (dedupKey) seenIds.add(dedupKey);
         continue;
       }
 
-      const delta = {
-        input_tokens: input,
-        cached_input_tokens: cacheReadClamped,
-        cache_creation_input_tokens: cacheWriteForAccounting,
-        output_tokens: outputWithoutReasoning,
-        reasoning_output_tokens: reasoningClamped,
-        total_tokens:
-          input +
-          outputWithoutReasoning +
-          cacheReadClamped +
-          cacheWriteForAccounting +
-          reasoningClamped,
-        conversation_count: 1,
-      };
-
-      const bucket = getHourlyBucket(hourlyState, "copilot", model, bucketStart);
-      addTotals(bucket.totals, delta);
-      touchedBuckets.add(bucketKey("copilot", model, bucketStart));
+      const bucket = getHourlyBucket(
+        hourlyState,
+        "copilot",
+        usage.model,
+        usage.bucketStart,
+      );
+      addTotals(bucket.totals, usage.delta);
+      touchedBuckets.add(bucketKey("copilot", usage.model, usage.bucketStart));
       eventsAggregated++;
-      if (cliSpan && cliSessionId) {
+      if (usage.cliSpan && usage.cliSessionId) {
         recentOtelUsageEvents.push({
-          ...matchBase,
-          input,
+          ...usage.matchBase,
+          input: usage.delta.input_tokens,
           firstSeenAtMs: claimNowMs,
         });
       }
@@ -13752,7 +14683,7 @@ async function parseCopilotIncremental({
   cursors.hourly = hourlyState;
   cursors.copilot = {
     ...copilotState,
-    version: COPILOT_PARSER_VERSION,
+    version: cursorVersion,
     seenIds: cappedSeen,
     fileOffsets,
     recentUsageEvents: retainedRecentOtelUsageEvents,
@@ -16629,36 +17560,55 @@ function isCjkCodePoint(code) {
 // (session transcripts are SQLCipher-encrypted; memory summaries carry no
 // token counts), so the token-count-only queue is intentionally never written
 // for this provider — the cloud hourly table stays clean.
-function resolveTraePath(env = process.env) {
+// Ordered candidate app-dir names. The CN IDE build installs as "Trae CN" on
+// Windows; the international build installs as "TRAE SOLO". Both expose the same
+// iCubeServerData entitlement key, so either is a valid Trae IDE install.
+function traeCandidateAppDirs(env = process.env) {
   const override = env.TOKENTRACKER_TRAE_HOME;
   if (typeof override === "string" && override.trim().length > 0) {
-    return override.trim();
+    return [override.trim()];
   }
   const home = require("node:os").homedir();
   if (process.platform === "darwin") {
-    return path.join(home, "Library", "Application Support", "TRAE SOLO");
+    return [path.join(home, "Library", "Application Support", "TRAE SOLO")];
   }
   if (process.platform === "win32") {
     // A Windows box with no APPDATA still keeps Trae under the standard
     // roaming profile — falling through to the dot-dir below would point at
     // a location Trae never writes.
-    const appData = typeof env.APPDATA === "string" ? env.APPDATA.trim() : "";
-    return appData
-      ? path.join(appData, "TRAE SOLO")
-      : path.join(home, "AppData", "Roaming", "TRAE SOLO");
+    const appData =
+      typeof env.APPDATA === "string" && env.APPDATA.trim()
+        ? env.APPDATA.trim()
+        : path.join(home, "AppData", "Roaming");
+    return [
+      path.join(appData, "TRAE SOLO"),
+      path.join(appData, "Trae CN"),
+    ];
   }
   // Linux and friends: TRAE SOLO ships official builds for macOS/Windows
   // only, so there is no verified app-data layout to default to. Fall back to
   // a deterministic home-dir path (best-effort detection);
   // TOKENTRACKER_TRAE_HOME always wins for unusual installs.
-  return path.join(home, ".trae-solo");
+  return [path.join(home, ".trae-solo")];
+}
+
+// Best-effort: the first candidate that exists on disk (used for display/init
+// detection). When no install is present, returns the primary candidate so
+// callers still get a deterministic path to report.
+function resolveTraePath(env = process.env) {
+  const candidates = traeCandidateAppDirs(env);
+  for (const dir of candidates) {
+    try { if (fssync.existsSync(dir)) return dir; } catch (_error) {}
+  }
+  return candidates.length ? candidates[0] : null;
 }
 
 function resolveTraeStoragePath(env = process.env) {
-  const traHome = resolveTraePath(env);
-  if (!traHome) return null;
-  const p = path.join(traHome, "User", "globalStorage", "storage.json");
-  return fssync.existsSync(p) ? p : null;
+  for (const dir of traeCandidateAppDirs(env)) {
+    const p = path.join(dir, "User", "globalStorage", "storage.json");
+    try { if (fssync.existsSync(p)) return p; } catch (_error) {}
+  }
+  return null;
 }
 
 /**
@@ -17908,8 +18858,10 @@ module.exports = {
   listGeminiSessionFiles,
   listOpencodeMessageFiles,
   readOpencodeDbMessages,
+  readOpencodeDbMessagesIncremental,
   readMimoDbMessages,
   readZcodeDbMessages,
+  hasZcodeNativeUsageSchema,
   resolveQoderDbPath,
   resolveQoderDbPaths,
   resolveQoderCnDbPaths,

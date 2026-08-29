@@ -52,6 +52,8 @@ test('icon sync reads the destination directly without an exists-then-read race'
   const script = fs.readFileSync(new URL('../scripts/sync-tauri-icon.mjs', import.meta.url), 'utf8');
   assert.doesNotMatch(script, /existsSync\s*\(/);
   assert.match(script, /error\.code !== ['"]ENOENT['"]/);
+  assert.match(script, /writeFileSync\(temporaryPath/);
+  assert.match(script, /renameSync\(temporaryPath, destinationPath\)/);
 });
 
 test('sync writes a deterministic RGBA Tauri icon', () => {
@@ -66,6 +68,31 @@ test('sync writes a deterministic RGBA Tauri icon', () => {
 
     assert.deepEqual(first, second);
     assert.equal(pngHeader(first).colorType, 6);
+  } finally {
+    fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test('icon sync replaces a destination symlink without writing through it', () => {
+  const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'tokentracker-icon-link-'));
+  const sentinel = path.join(temporaryDirectory, 'sentinel.txt');
+  const destination = path.join(temporaryDirectory, 'icon.png');
+
+  try {
+    fs.writeFileSync(sentinel, 'do not replace');
+    fs.symlinkSync(sentinel, destination);
+
+    syncTauriIcon(canonicalIconPath, destination);
+
+    assert.equal(fs.readFileSync(sentinel, 'utf8'), 'do not replace');
+    // O_NOFOLLOW: throws if the destination is still a symlink, and the same
+    // open serves the content read — no check-then-use race.
+    const fd = fs.openSync(destination, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      assert.equal(pngHeader(fs.readFileSync(fd)).colorType, 6);
+    } finally {
+      fs.closeSync(fd);
+    }
   } finally {
     fs.rmSync(temporaryDirectory, { recursive: true, force: true });
   }

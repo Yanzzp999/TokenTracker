@@ -493,6 +493,8 @@ settings.network.apply_error,ui,SettingsPage,NetworkSection,apply_error,"The sav
 settings.network.save_error,ui,SettingsPage,NetworkSection,save_error,"Could not save proxy settings: {{error}}",,active
 settings.network.save_error_unprotected,ui,SettingsPage,NetworkSection,save_error_unprotected,"Could not save proxy settings: {{error}}. Outbound traffic is currently unprotected — even blocking it failed.",,active
 settings.limits.providers,ui,SettingsPage,SettingsPage,limits_providers,"Providers",,active
+settings.limits.showSubscriptions,ui,SettingsPage,SettingsPage,show_subscriptions,"Show subscriptions in limits",,active
+settings.limits.showSubscriptionsHint,ui,SettingsPage,SettingsPage,show_subscriptions_hint,"Display your manual subscription renewal bars alongside the limits.",,active
 settings.labs.island.label,ui,SettingsPage,LabsSection,island_label,"Dynamic Island",,active
 settings.labs.island.hint,ui,SettingsPage,LabsSection,island_hint,"Turn the MacBook notch into a Dynamic Island: today's tokens and spend at a glance, hover for spend and limit details.",,active
 settings.labs.island.aria,ui,SettingsPage,LabsSection,island_aria,"Toggle Dynamic Island",,active
@@ -731,6 +733,7 @@ limits.panel.mode_separator,ui,LimitsPage,UsageLimitsPanel,title_separator," · 
 limits.label.cursor_plan,ui,LimitsPage,UsageLimitsPanel,cursor_plan,"Plan",,active
 limits.label.cursor_auto,ui,LimitsPage,UsageLimitsPanel,cursor_auto,"Auto",,active
 limits.label.cursor_api,ui,LimitsPage,UsageLimitsPanel,cursor_api,"API",,active
+limits.label.cursor_grok_bot,ui,LimitsPage,UsageLimitsPanel,cursor_grok_bot,"Grok Bot",,active
 limits.label.kiro_month,ui,LimitsPage,UsageLimitsPanel,kiro_month,"Month",,active
 limits.label.kiro_bonus,ui,LimitsPage,UsageLimitsPanel,kiro_bonus,"Bonus",,active
 limits.label.kiro_tracked_credits,ui,LimitsPage,UsageLimitsPanel,kiro_tracked_credits,"Local usage: {{credits}} credits · {{count}} turns",,active
@@ -1421,6 +1424,14 @@ sessions.badge.partial_usage,ui,SessionsPage,SessionsPage,badge_partial_usage,"P
 sessions.grok.token_breakdown,ui,SessionsPage,SessionsPage,grok_token_breakdown,"Input {{input}} · Cache read {{cacheRead}} · Cache write {{cacheWrite}} · Output {{output}} · Reasoning {{reasoning}}",,active
 sessions.grok.runtime_breakdown,ui,SessionsPage,SessionsPage,grok_runtime_breakdown,"Model calls {{calls}} · API {{seconds}}s · Tools {{tools}} · Errors {{errors}}",,active
 sessions.grok.context_breakdown,ui,SessionsPage,SessionsPage,grok_context_breakdown,"Context {{used}} / {{window}} ({{percent}}%)",,active
+sessions.badge.subagent,ui,SessionsPage,SessionRow,badge_subagent,"Subagent",,active
+sessions.thread.expand,ui,SessionsPage,SessionRow,thread_expand,"Expand {{count}} subagents",,active
+sessions.thread.collapse,ui,SessionsPage,SessionRow,thread_collapse,"Collapse {{count}} subagents",,active
+sessions.thread.tokens_summary,ui,SessionsPage,SessionRow,tokens_summary,"Own {{own}} · Subagents {{subagents}} · Combined {{combined}}",,active
+sessions.thread.result_count,ui,SessionsPage,SessionsPage,thread_result_count,"{{roots}} root sessions · {{subagents}} subagents collapsed",,active
+sessions.thread.model_usage,ui,SessionsPage,ThreadModelUsage,model_usage,"Subagent model usage",,active
+sessions.thread.model_all,ui,SessionsPage,ThreadModelUsage,model_all,"All · {{count}} agents · {{tokens}}",,active
+sessions.thread.model_item,ui,SessionsPage,ThreadModelUsage,model_item,"{{model}} · {{count}} agents · {{tokens}}",,active
 sessions.duration.minutes,ui,SessionsPage,SessionsPage,duration_minutes,"{{minutes}}m",,active
 sessions.duration.hours,ui,SessionsPage,SessionsPage,duration_hours,"{{hours}}h {{minutes}}m",,active
 sessions.project.unknown,ui,SessionsPage,SessionsPage,project_unknown,"Untitled session",,active
@@ -1519,6 +1530,40 @@ landing.v3.how.scene.files_changed,landing,LandingPage,HowItWorksSection,scene_f
 landing.v3.how.scene.session_title,landing,LandingPage,HowItWorksSection,scene_session_title,"session log · last turn",,active
 landing.v3.how.scene.appended,landing,LandingPage,HowItWorksSection,scene_appended,"appended locally",,active
 landing.v3.how.scene.total_tokens,landing,LandingPage,HowItWorksSection,scene_total_tokens,"total tokens",,active
+subscriptions.add,ui,LimitsPage,SubscriptionSettingsCard,add,"Add subscription",,active
+subscriptions.edit,ui,LimitsPage,SubscriptionSettingsCard,edit,"Edit",,active
+subscriptions.delete,ui,LimitsPage,SubscriptionSettingsCard,delete,"Delete",,active
+subscriptions.save,ui,LimitsPage,SubscriptionSettingsCard,save,"Save",,active
+subscriptions.confirm_delete_title,ui,LimitsPage,SubscriptionSettingsCard,confirm_delete_title,"Delete this subscription?",,active
+subscriptions.delete_error,ui,LimitsPage,SubscriptionSettingsCard,delete_error,"Failed to delete. Please try again.",,active
+subscriptions.form.plan,ui,LimitsPage,SubscriptionSettingsCard,form_plan,"Plan",,active
+subscriptions.form.plan_placeholder,ui,LimitsPage,SubscriptionSettingsCard,form_plan_placeholder,"e.g. Plus, Pro",,active
+subscriptions.form.auto_renew,ui,LimitsPage,SubscriptionSettingsCard,form_auto_renew,"Auto-renew",,active
+subscriptions.form.auto_renew_on,ui,LimitsPage,SubscriptionSettingsCard,form_auto_renew_on,"On",,active
+subscriptions.form.auto_renew_off,ui,LimitsPage,SubscriptionSettingsCard,form_auto_renew_off,"Off",,active
+subscriptions.form.started_at,ui,LimitsPage,SubscriptionSettingsCard,form_started_at,"Subscription date",,active
+subscriptions.form.cycle,ui,LimitsPage,SubscriptionSettingsCard,form_cycle,"Billing cycle",,active
+subscriptions.form.cycle_weekly,ui,LimitsPage,SubscriptionSettingsCard,form_cycle_weekly,"Weekly",,active
+subscriptions.form.cycle_monthly,ui,LimitsPage,SubscriptionSettingsCard,form_cycle_monthly,"Monthly",,active
+subscriptions.form.cycle_yearly,ui,LimitsPage,SubscriptionSettingsCard,form_cycle_yearly,"Yearly",,active
+subscriptions.form.error,ui,LimitsPage,SubscriptionSettingsCard,form_error,"Something went wrong. Please try again.",,active
+subscriptions.status.auto_renew,ui,LimitsPage,SubscriptionSettingsCard,status_auto_renew,"Auto-renew on",,active
+subscriptions.status.manual,ui,LimitsPage,SubscriptionSettingsCard,status_manual,"Auto-renew off",,active
+subscriptions.label.renews_at,ui,LimitsPage,SubscriptionSettingsCard,label_renews_at,"Next renewal",,active
+subscriptions.label.expires_at,ui,LimitsPage,SubscriptionSettingsCard,label_expires_at,"Expires",,active
+subscriptions.countdown,ui,LimitsPage,SubscriptionSettingsCard,countdown,"in {{days}}d {{hours}}h {{minutes}}m",,active
+subscriptions.expired,ui,LimitsPage,SubscriptionSettingsCard,expired,"Expired",,active
+subscriptions.empty.title,ui,LimitsPage,SubscriptionSettingsCard,empty_title,"No subscriptions yet",,active
+subscriptions.empty.body,ui,LimitsPage,SubscriptionSettingsCard,empty_body,"Add a plan to keep an eye on its next renewal or expiry date.",,active
+subscriptions.load_error,ui,LimitsPage,LimitsPage,load_error,"Failed to load subscriptions.",,active
+subscriptions.inline.label,ui,LimitsPage,UsageLimitsPanel,inline_label,"Subscription",,active
+subscriptions.badge.auto_renew,ui,LimitsPage,UsageLimitsPanel,badge_auto_renew,"Auto-renew",,active
+subscriptions.badge.stops,ui,LimitsPage,UsageLimitsPanel,badge_stops,"Stops at expiry",,active
+subscriptions.form.provider,ui,LimitsPage,SubscriptionSettingsCard,form_provider,"Linked tool",,active
+subscriptions.form.provider_required,ui,LimitsPage,SubscriptionSettingsCard,form_provider_required,"Select a linked tool.",,active
+subscriptions.form.provider_taken,ui,LimitsPage,SubscriptionSettingsCard,form_provider_taken,"This tool already has a subscription. Edit the existing record instead.",,active
+subscriptions.form.provider_taken_suffix,ui,LimitsPage,SubscriptionSettingsCard,form_provider_taken_suffix,"(already subscribed)",,active
+limits.page.openSubscriptions,ui,LimitsPage,LimitsPage,open_subscriptions,"Subscriptions",,active
 limits.provider.ark_coding_plan,ui,LimitsPage,UsageLimitsPanel,provider_ark_coding_plan,"Ark Coding Plan",,active
 limits.label.ark_coding_plan_5h,ui,LimitsPage,UsageLimitsPanel,ark_coding_plan_5h,"5h",,active
 limits.label.ark_coding_plan_weekly,ui,LimitsPage,UsageLimitsPanel,ark_coding_plan_weekly,"Weekly",,active

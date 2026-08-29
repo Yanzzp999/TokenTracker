@@ -26,8 +26,10 @@ const {
   listGeminiSessionFiles,
   listOpencodeMessageFiles,
   readOpencodeDbMessages,
+  readOpencodeDbMessagesIncremental,
   readMimoDbMessages,
   readZcodeDbMessages,
+  hasZcodeNativeUsageSchema,
   resolveQoderDbPaths,
   resolveQoderCnDbPaths,
   readQoderDbMessages,
@@ -257,6 +259,7 @@ const CODEX_COLD_SCAN_AUDIT_MAX_SYNCS = 288;
 // state so the next sync (providerID-filtered reader) rebuilds it correctly.
 const MIMO_PROVIDER_REPAIR_KEY = "mimoClaudeMislabelRepair_2026_06";
 const DSH_LEGACY_SOURCE_MIGRATION_KEY = "deepseekHarnessSourceMigration_2026_08";
+const ZCODE_NATIVE_USAGE_REPAIR_KEY = "zcodeNativeUsageRepair_2026_08";
 const AUTO_SYNC_SOURCE_ALIASES = new Map([
   ["code", "every-code"],
   ["deepseek", "dsh"],
@@ -468,6 +471,9 @@ async function cmdSync(argv, context = {}) {
   const traeCnNowMs = context && typeof context === "object"
     ? context.traeCnNowMs
     : undefined;
+  const cursorSyncDeps = context && typeof context.cursorSyncDeps === "object"
+    ? context.cursorSyncDeps
+    : {};
   const syncDiagnostics = diagnostics && typeof diagnostics === "object" ? diagnostics : null;
   const home = os.homedir();
   const { trackerDir } = await resolveTrackerPaths({ home });
@@ -719,14 +725,21 @@ async function cmdSync(argv, context = {}) {
         ? cursors.codexDayInventoryCache
         : { version: 1, days: {} };
     if (sourceAllowed("codex")) cursors.codexDayInventoryCache = codexDayInventoryCache;
-    for (const entry of sources) {
-      if (seenSessions.has(entry.sessionsDir)) continue;
+    const uniqueSources = sources.filter((entry) => {
+      if (seenSessions.has(entry.sessionsDir)) return false;
       seenSessions.add(entry.sessionsDir);
-      const files = entry.deep
-        ? await listRolloutFilesDeep(entry.sessionsDir)
-        : await listRolloutFiles(entry.sessionsDir, entry.codexInventoryCache
+      return true;
+    });
+    const sourceFileGroups = await Promise.all(uniqueSources.map((entry) => (
+      entry.deep
+        ? listRolloutFilesDeep(entry.sessionsDir)
+        : listRolloutFiles(entry.sessionsDir, entry.codexInventoryCache
           ? { dayInventoryCache: codexDayInventoryCache }
-          : undefined);
+          : undefined)
+    )));
+    for (let sourceIndex = 0; sourceIndex < uniqueSources.length; sourceIndex++) {
+      const entry = uniqueSources[sourceIndex];
+      const files = sourceFileGroups[sourceIndex];
       for (const filePath of files) {
         rolloutFiles.push({ path: filePath, source: entry.source });
       }
@@ -1152,11 +1165,15 @@ async function cmdSync(argv, context = {}) {
         let dbResult = { messagesProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
         if (dbDir) {
           const dbPath = path.join(dbDir, "opencode.db");
-          const dbMessages = readOpencodeDbMessages(dbPath);
-          if (dbMessages.length > 0) {
+          const dbRead = readOpencodeDbMessagesIncremental(
+            dbPath,
+            cursors?.opencode?.dbCursor,
+          );
+          if (dbRead.messages.length > 0 || dbRead.cursor) {
             dbResult = await parseOpencodeDbIncremental({
               ...options,
-              dbMessages,
+              dbMessages: dbRead.messages,
+              dbCursor: dbRead.cursor,
               dbPath,
             });
           }
@@ -1403,6 +1420,18 @@ async function cmdSync(argv, context = {}) {
       if (zcodePaths.native || zcodePaths.wsl) {
         if (progress?.enabled) progress.start(`Parsing ZCode ${renderBar(0)} | buckets 0`);
         try {
+          const nativeUsageAvailable = [zcodePaths.native, zcodePaths.wsl]
+            .filter(Boolean)
+            .some((dbPath) => hasZcodeNativeUsageSchema(dbPath));
+          if (nativeUsageAvailable) {
+            await repairZcodeNativeUsageMigration({
+              cursors,
+              queuePath,
+              queueStatePath,
+              projectQueuePath,
+              projectQueueStatePath,
+            });
+          }
           zcodeResult = await multiInstallParse({
             paths: zcodePaths, parserFn: parseOpencodeDbForInstall, providerName: "zcode",
             cursors, getParams: (p) => ({ dbPath: p, readFn: readZcodeDbMessages, source: "zcode", cursorKey: "zcode" }),
@@ -1640,14 +1669,17 @@ async function cmdSync(argv, context = {}) {
     }
 
     let cursorResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
-    if (!isBackgroundLightweightSync && sourceAllowed("cursor") && isCursorInstalled({ home })) {
-      const cursorAuth = extractCursorSessionToken({ home });
+    const cursorInstalled = cursorSyncDeps.isInstalled || isCursorInstalled;
+    const cursorAuthExtractor = cursorSyncDeps.extractAuth || extractCursorSessionToken;
+    const cursorUsageFetcher = cursorSyncDeps.fetchUsageCsv || fetchCursorUsageCsv;
+    if (sourceAllowed("cursor") && cursorInstalled({ home })) {
+      const cursorAuth = cursorAuthExtractor({ home });
       if (cursorAuth) {
         try {
           if (progress?.enabled) {
             progress.start(`Fetching Cursor usage...`);
           }
-          const csvText = await fetchCursorUsageCsv({ cookie: cursorAuth.cookie });
+          const csvText = await cursorUsageFetcher({ cookie: cursorAuth.cookie });
           const records = parseCursorCsv(csvText);
           if (records.length > 0) {
             if (progress?.enabled) {
@@ -3105,6 +3137,7 @@ module.exports = {
   repairCodexInterleavedUsageInflation,
   repairDroidDuplicateSessionInflation,
   repairMimoClaudeMislabel,
+  repairZcodeNativeUsageMigration,
   reincludeClaudeMemObserverFiles,
   repairGrokQueueFromSessionSnapshots,
   applyCloudConversationsBackfill,
@@ -4079,6 +4112,128 @@ async function repairMimoClaudeMislabel({
     appliedAt: new Date().toISOString(),
     removedMain,
     removedProject,
+  };
+  return true;
+}
+
+async function resetUploadOffsetForZcodeNativeRepair(queueStatePath) {
+  if (typeof queueStatePath !== "string" || !queueStatePath) return false;
+  let state = {};
+  try {
+    state = JSON.parse(await fs.readFile(queueStatePath, "utf8"));
+  } catch (_error) {
+    state = {};
+  }
+  state.offset = 0;
+  state.updatedAt = new Date().toISOString();
+  state.note = "reset_after_zcode_native_usage_repair_2026_08";
+  await ensureDir(path.dirname(queueStatePath));
+  await fs.writeFile(queueStatePath, JSON.stringify(state, null, 2) + "\n", "utf8");
+  return true;
+}
+
+async function dropZcodeQueueRows(filePath, { retainRetractions = false } = {}) {
+  let raw;
+  try {
+    raw = await fs.readFile(filePath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return { removed: 0, retractions: 0 };
+    throw error;
+  }
+  const kept = [];
+  const retractions = new Map();
+  let removed = 0;
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch (_error) {
+      kept.push(line);
+      continue;
+    }
+    if (row?.source === "zcode") {
+      removed += 1;
+      const model = typeof row.model === "string" && row.model.trim()
+        ? row.model.trim()
+        : "unknown";
+      const hourStart = typeof row.hour_start === "string" ? row.hour_start : "";
+      if (retainRetractions && hourStart) {
+        retractions.set(`${model}|${hourStart}`, {
+          source: "zcode",
+          model,
+          hour_start: hourStart,
+          input_tokens: 0,
+          cached_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+          output_tokens: 0,
+          reasoning_output_tokens: 0,
+          total_tokens: 0,
+          conversation_count: 0,
+        });
+      }
+      continue;
+    }
+    kept.push(line);
+  }
+  if (removed === 0) return { removed: 0, retractions: 0 };
+  await backupExistingFile(filePath);
+  const tmp = `${filePath}.zcoderepair.${process.pid}.${Date.now()}`;
+  const rewritten = [
+    ...kept,
+    ...[...retractions.values()].map((row) => JSON.stringify(row)),
+  ];
+  await fs.writeFile(tmp, rewritten.length ? rewritten.join("\n") + "\n" : "", "utf8");
+  await fs.rename(tmp, filePath);
+  return { removed, retractions: retractions.size };
+}
+
+async function repairZcodeNativeUsageMigration({
+  cursors,
+  queuePath,
+  queueStatePath,
+  projectQueuePath,
+  projectQueueStatePath,
+} = {}) {
+  if (!cursors || typeof cursors !== "object") return false;
+  const migrations = (cursors.migrations ||= {});
+  if (migrations[ZCODE_NATIVE_USAGE_REPAIR_KEY]) return false;
+
+  const mainRepair = await dropZcodeQueueRows(queuePath, { retainRetractions: true });
+  const projectRepair = projectQueuePath
+    ? await dropZcodeQueueRows(projectQueuePath)
+    : { removed: 0, retractions: 0 };
+
+  const hourly = cursors.hourly && typeof cursors.hourly === "object" ? cursors.hourly : null;
+  if (hourly?.buckets) {
+    for (const key of Object.keys(hourly.buckets)) {
+      if (key.startsWith("zcode|")) delete hourly.buckets[key];
+    }
+  }
+  if (hourly?.groupQueued) {
+    for (const key of Object.keys(hourly.groupQueued)) {
+      if (key.startsWith("zcode|")) delete hourly.groupQueued[key];
+    }
+  }
+  const projectHourly = cursors.projectHourly && typeof cursors.projectHourly === "object"
+    ? cursors.projectHourly
+    : null;
+  if (projectHourly?.buckets) {
+    for (const key of Object.keys(projectHourly.buckets)) {
+      if (key.includes("|zcode|")) delete projectHourly.buckets[key];
+    }
+  }
+  delete cursors.zcode;
+
+  if (mainRepair.removed > 0) await resetUploadOffsetForZcodeNativeRepair(queueStatePath);
+  if (projectRepair.removed > 0) {
+    await resetUploadOffsetForZcodeNativeRepair(projectQueueStatePath);
+  }
+  migrations[ZCODE_NATIVE_USAGE_REPAIR_KEY] = {
+    appliedAt: new Date().toISOString(),
+    removedMain: mainRepair.removed,
+    removedProject: projectRepair.removed,
+    retractions: mainRepair.retractions,
   };
   return true;
 }

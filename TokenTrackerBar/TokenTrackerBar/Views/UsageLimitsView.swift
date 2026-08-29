@@ -3,6 +3,7 @@ import AppKit
 
 struct UsageLimitsView: View {
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject private var settings = LimitsSettingsStore.shared
     @State private var showSettings = false
     /// Width of the widest visible row label; all label columns match it so
@@ -13,6 +14,7 @@ struct UsageLimitsView: View {
     /// to read its bars. A click toggle — not hover — so nothing reflows/jitters.
     @State private var explainingProvider: String?
     let limits: UsageLimitsResponse?
+    var subscriptions: [SubscriptionRecord] = []
 
     private static let rowColumnSpacing: CGFloat = 5
     private static let percentColumnWidth: CGFloat = 34
@@ -65,6 +67,33 @@ struct UsageLimitsView: View {
     /// Append the plan tier to the provider name when known, e.g. "Claude Max".
     private func planTitle(_ base: String, _ label: String?) -> String {
         label.map { "\(base) \($0)" } ?? base
+    }
+
+    private var subscriptionByProvider: [String: SubscriptionRecord] {
+        guard settings.showSubscriptions else { return [:] }
+        let nowMs = Date().timeIntervalSince1970 * 1000.0
+        var map: [String: SubscriptionRecord] = [:]
+        for sub in subscriptions {
+            guard let provider = sub.provider, !provider.isEmpty else { continue }
+            guard let endMs = SubscriptionCycle.parseDateMs(sub.nextBillingAt) else { continue }
+            guard sub.provider != nil else { continue }
+            let existing = map[provider]
+            if existing == nil {
+                map[provider] = sub
+                continue
+            }
+            guard let existingEnd = SubscriptionCycle.parseDateMs(existing!.nextBillingAt) else {
+                map[provider] = sub
+                continue
+            }
+            let upcoming = endMs > nowMs
+            let existingUpcoming = existingEnd > nowMs
+            if (upcoming && (!existingUpcoming || existingEnd > endMs)) ||
+               (!upcoming && !existingUpcoming && endMs > existingEnd) {
+                map[provider] = sub
+            }
+        }
+        return map
     }
 
     private func buildVisibleGroups(_ limits: UsageLimitsResponse) -> [AnyView] {
@@ -157,6 +186,7 @@ struct UsageLimitsView: View {
         )
         let updatedAt = resetDate(iso: updatedAtISO ?? limits?.fetchedAt)
         let retryAt = resetDate(iso: retryAtISO)
+        let subscription = subscriptionByProvider[id]
         return VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 5) {
                 if let assetName {
@@ -166,15 +196,26 @@ struct UsageLimitsView: View {
                 Text(title)
                     .font(.system(.caption, design: .default))
                     .modifier(FontWeightModifier(weight: .medium))
+                if let sub = subscription {
+                    Image(systemName: sub.autoRenew ? "infinity" : "clock")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(sub.autoRenew ? Color.accentColor : Color.secondary)
+                        .help(sub.autoRenew ? Strings.subscriptionAutoRenewBadge : Strings.subscriptionStopsBadge)
+                        .accessibilityLabel(sub.autoRenew ? Strings.subscriptionAutoRenewBadge : Strings.subscriptionStopsBadge)
+                }
                 if let titleSuffix {
                     Text(titleSuffix)
                         .font(.system(.caption2, design: .default))
                         .foregroundStyle(.tertiary)
                 }
+                Spacer()
             }
             VStack(spacing: 4) {
                 ForEach(specs) { spec in
                     limitRow(label: spec.label, pct: spec.pct, reset: spec.resetText, toolName: toolName, windowSeconds: spec.windowSeconds, resetDate: spec.resetDate)
+                }
+                if let sub = subscription {
+                    subscriptionRow(for: sub)
                 }
             }
             if !resetRows.isEmpty || resetStatus != nil {
@@ -316,6 +357,14 @@ struct UsageLimitsView: View {
         if let w = c.tertiaryWindow {
             s.append(makeSpec(
                 "API",
+                w.usedPercent,
+                windowSeconds: w.limitWindowSeconds,
+                iso: w.resetAt
+            ))
+        }
+        if let w = c.quaternaryWindow {
+            s.append(makeSpec(
+                Strings.cursorGrokBotLabel,
                 w.usedPercent,
                 windowSeconds: w.limitWindowSeconds,
                 iso: w.resetAt
@@ -473,7 +522,7 @@ struct UsageLimitsView: View {
                 pacePercent: pacePercent,
                 paceOver: paceOver
             )
-            .animation(.easeOut(duration: 0.5), value: displayValue)
+            .animation(reduceMotion ? .none : .easeOut(duration: 0.5), value: displayValue)
 
             Text(displayPercentLabel(displayValue))
                 .font(.system(.caption, design: .monospaced))
@@ -491,6 +540,56 @@ struct UsageLimitsView: View {
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
+    }
+
+    private func subscriptionRow(for subscription: SubscriptionRecord) -> some View {
+        let nowMs = Date().timeIntervalSince1970 * 1000.0
+        guard let view = SubscriptionCycle.cycleView(subscription: subscription, nowMs: nowMs) else {
+            return AnyView(EmptyView())
+        }
+        let isNearExpiry = !view.expired && view.endMs - nowMs <= 3 * 86400000
+        let fillColor: Color = view.expired ? .red : (isNearExpiry ? .orange : .blue)
+        let rawPct = view.progress * 100.0
+        let displayPct = view.expired ? 100.0 : (settings.displayMode == .remaining ? 100.0 - rawPct : rawPct)
+        let clampedPct = max(0, min(100, displayPct))
+        let rounded = Int(clampedPct.rounded())
+        let percentLabel: String = (clampedPct > 0 && rounded == 0) ? "<1%" : "\(rounded)%"
+        let remaining = SubscriptionCycle.remainingLabel(endMs: view.endMs, nowMs: nowMs)
+        let a11y = "\(Strings.subscriptionLabel) \(percentLabel) \(remaining)"
+        return AnyView(
+            HStack(spacing: Self.rowColumnSpacing) {
+                Text(Strings.subscriptionLabel)
+                    .font(.system(.caption, design: .default))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .background(GeometryReader { proxy in
+                        Color.clear.preference(key: LimitLabelWidthKey.self, value: proxy.size.width)
+                    })
+                    .frame(width: labelColumnWidth > 0 ? labelColumnWidth : nil, alignment: .leading)
+
+                UsageLimitBar(
+                    percent: clampedPct,
+                    fillColor: fillColor,
+                    pacePercent: nil,
+                    paceOver: false
+                )
+
+                Text(percentLabel)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .frame(width: Self.percentColumnWidth, alignment: .trailing)
+
+                Text(remaining)
+                    .font(.system(.caption2, design: .default))
+                    .monospacedDigit()
+                    .foregroundStyle(view.expired ? AnyShapeStyle(Color.red) : AnyShapeStyle(.tertiary))
+                    .frame(width: Self.relativeResetColumnWidth, alignment: .trailing)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(a11y)
+        )
     }
 
     private func resetSection(rows: [CodexResetRowSpec], status: String?) -> some View {

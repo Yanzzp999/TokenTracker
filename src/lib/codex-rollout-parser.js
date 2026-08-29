@@ -568,6 +568,14 @@ async function parseCodexRolloutFile(filePath, {
   let model = isResuming ? resumeState.model || null : null;
   let provider = isResuming ? resumeState.provider || null : null;
   let cliVersion = isResuming ? resumeState.cliVersion || null : null;
+  let forkedFromId = isResuming ? resumeState.forkedFromId || null : null;
+  let parentThreadId = isResuming ? resumeState.parentThreadId || null : null;
+  let threadSource = isResuming ? resumeState.threadSource || null : null;
+  let agentNickname = isResuming ? resumeState.agentNickname || null : null;
+  let agentRole = isResuming ? resumeState.agentRole || null : null;
+  let sessionLineageCaptured = isResuming
+    ? Boolean(resumeState.sessionLineageCaptured || resumeState.sessionId)
+    : false;
 
   const usageDeltaState = createUsageDeltaState({
     lastTotal: isResuming ? resumeState.prevTotals || null : null,
@@ -820,10 +828,22 @@ async function parseCodexRolloutFile(filePath, {
 
     if (obj.type === "session_meta") {
       const p = obj.payload || {};
-      sessionId = p.id || sessionId;
-      cwd = p.cwd || cwd;
-      cliVersion = p.cli_version || cliVersion;
-      provider = p.model_provider || provider;
+      // Forked rollouts replay historical session_meta rows after their own
+      // child metadata. Only the first row describes this file's lineage.
+      if (!sessionLineageCaptured) {
+        sessionId = p.id || sessionId;
+        cwd = p.cwd || cwd;
+        cliVersion = p.cli_version || cliVersion;
+        provider = p.model_provider || provider;
+        forkedFromId = p.forked_from_id || null;
+        parentThreadId = p.parent_thread_id || null;
+        threadSource = p.thread_source || p.source || null;
+        agentNickname = p.agent_nickname || null;
+        agentRole = p.agent_role || null;
+        sessionLineageCaptured = true;
+      } else if (!sessionId) {
+        sessionId = p.id || null;
+      }
     }
 
     if (obj.type === "turn_context") {
@@ -878,6 +898,11 @@ async function parseCodexRolloutFile(filePath, {
     model: model || provider,
     provider,
     version: cliVersion,
+    forkedFromId,
+    parentThreadId,
+    threadSource,
+    agentNickname,
+    agentRole,
     filePath: primaryFilePath,
     turnCount,
     totals,
@@ -903,6 +928,12 @@ async function parseCodexRolloutFile(filePath, {
       model,
       provider,
       cliVersion,
+      forkedFromId,
+      parentThreadId,
+      threadSource,
+      agentNickname,
+      agentRole,
+      sessionLineageCaptured,
       prevTotals: usageDeltaState.lastTotal,
       tokenUsageBaselines: snapshotUsageBaselines(usageDeltaState),
       pendingToolNames,

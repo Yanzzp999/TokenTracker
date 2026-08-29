@@ -1,12 +1,18 @@
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
 const http = require("node:http");
+const os = require("node:os");
+const path = require("node:path");
 const { test } = require("node:test");
 
 const {
   buildPortInUseHint,
   isPortUnavailableError,
+  ensurePortFree,
+  isTokenTrackerServeCommand,
   listenOnAvailablePort,
   NPM_PACKAGE_NAME,
+  parseServeScriptPath,
   parseArgs,
   isRunningUnderWsl,
   resolveDefaultPort,
@@ -158,4 +164,136 @@ test("isRunningUnderWsl is false off Linux regardless of env", (t) => {
   mockPlatform(t, "darwin");
   assert.equal(isRunningUnderWsl({ WSL_DISTRO_NAME: "Ubuntu" }), false);
   assert.equal(resolveDefaultPort({ WSL_DISTRO_NAME: "Ubuntu" }), 7680);
+});
+
+test("serve-command parsing survives ps output quirks", () => {
+  // `ps -o command=` joins argv with spaces and drops all quoting, so the
+  // script path is only unambiguous relative to the `serve` argument after it.
+  assert.equal(
+    parseServeScriptPath("node /home/u/Token Tracker/bin/tracker.js serve"),
+    "/home/u/Token Tracker/bin/tracker.js",
+  );
+  assert.equal(
+    parseServeScriptPath("/opt/app/node /opt/app/tokentracker/bin/tracker.js serve --no-open"),
+    "/opt/app/tokentracker/bin/tracker.js",
+  );
+
+  // `serve` can occur inside the install path as well as being the subcommand,
+  // so the delimiter is chosen by which prefix is actually a tracker entry.
+  // Taking the first boundary would parse this as "/home/u/my".
+  assert.equal(
+    parseServeScriptPath("node /home/u/my serve dir/bin/tracker.js serve --port 7680"),
+    "/home/u/my serve dir/bin/tracker.js",
+  );
+  // ...and equally, a later `serve` among the arguments must not win.
+  assert.equal(
+    parseServeScriptPath("node /opt/tt/bin/tracker.js serve --dir /my serve/x"),
+    "/opt/tt/bin/tracker.js",
+  );
+
+  // Not a node `serve` invocation at all.
+  assert.equal(parseServeScriptPath("python3 /usr/lib/tokentracker/bin/tracker.js serve"), null);
+  assert.equal(parseServeScriptPath("node /usr/lib/tokentracker/bin/tracker.js sync"), null);
+  assert.equal(parseServeScriptPath("/usr/bin/postgres -D /var/lib/pgsql serve"), null);
+  assert.equal(parseServeScriptPath("nginx: worker process"), null);
+  // ps prints nothing once the pid is gone; never treat that as a match.
+  assert.equal(parseServeScriptPath(""), null);
+});
+
+test("port cleanup only targets a real TokenTracker package", (t) => {
+  // Path shape alone is not identifying: unrelated projects ship a
+  // `bin/tracker.js` too, so the entry must resolve into a genuine
+  // tokentracker-cli package before anything is signalled.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tt-serve-id-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const install = (name, pkgName) => {
+    const dir = path.join(root, name);
+    fs.mkdirSync(path.join(dir, "bin"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "bin", "tracker.js"), "");
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: pkgName }));
+    return path.join(dir, "bin", "tracker.js");
+  };
+
+  const ours = install("ours", NPM_PACKAGE_NAME);
+  assert.equal(isTokenTrackerServeCommand(`node ${ours} serve --port 7680`), true);
+
+  // Same layout, different package: someone else's tracker.
+  const theirs = install("theirs", "some-other-tracker");
+  assert.equal(isTokenTrackerServeCommand(`node ${theirs} serve`), false);
+
+  // The npm bin shim is a symlink into the package; realpath must be followed.
+  const shimDir = path.join(root, "node_modules", ".bin");
+  fs.mkdirSync(shimDir, { recursive: true });
+  const shim = path.join(shimDir, "tokentracker-cli");
+  fs.symlinkSync(ours, shim);
+  assert.equal(isTokenTrackerServeCommand(`node ${shim} serve`), true);
+
+  // The same, end to end: a genuine package under a directory containing
+  // " serve " must still be recognised, or its cleanup silently stops working.
+  const oddDir = path.join(root, "my serve dir");
+  fs.mkdirSync(path.join(oddDir, "bin"), { recursive: true });
+  fs.writeFileSync(path.join(oddDir, "bin", "tracker.js"), "");
+  fs.writeFileSync(path.join(oddDir, "package.json"), JSON.stringify({ name: NPM_PACKAGE_NAME }));
+  assert.equal(
+    isTokenTrackerServeCommand(`node ${path.join(oddDir, "bin", "tracker.js")} serve --port 7680`),
+    true,
+  );
+
+  // A lookalike path that does not exist resolves to nothing, so it is never
+  // signalled -- the case that made a bare path-shape check unsafe.
+  assert.equal(isTokenTrackerServeCommand("node /srv/other/bin/tracker.js serve"), false);
+  // tracker.js outside a bin/ directory is rejected before any filesystem work.
+  assert.equal(isTokenTrackerServeCommand("node /srv/other/tracker.js serve"), false);
+});
+
+test("port scan is limited to listeners, not everything touching the port", () => {
+  // `lsof -i tcp:<port>` matches a socket whose LOCAL *or REMOTE* port matches,
+  // so without -sTCP:LISTEN a browser connected to the dashboard is reported
+  // alongside the server it is talking to.
+  const source = fs.readFileSync(path.join(__dirname, "..", "src", "commands", "serve.js"), "utf8");
+  assert.match(source, /"-sTCP:LISTEN"/);
+});
+
+// Proves ensurePortFree consults the identity check rather than merely owning
+// one: a unit test of isTokenTrackerServeCommand alone still passes if the
+// filter is deleted from the kill path.
+test("ensurePortFree leaves an unrelated listener running", async (t) => {
+  const cp = require("node:child_process");
+  const hasLsof = (() => {
+    try {
+      cp.execFileSync("lsof", ["-v"], { stdio: "ignore", timeout: 5000 });
+      return true;
+    } catch (_e) {
+      return false;
+    }
+  })();
+  if (!hasLsof) return t.skip("ensurePortFree is a no-op without lsof");
+
+  // A separate process, because ensurePortFree skips its own pid for free.
+  const child = cp.spawn(
+    process.execPath,
+    [
+      "-e",
+      "const n=require('net');n.createServer(c=>c.on('error',()=>{}))" +
+        ".listen(0,'127.0.0.1',function(){process.stdout.write(String(this.address().port))});" +
+        "setInterval(()=>{},1000);",
+    ],
+    { stdio: ["ignore", "pipe", "ignore"] },
+  );
+  t.after(() => child.kill("SIGKILL"));
+
+  const port = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("listener never reported a port")), 10000);
+    child.stdout.once("data", (chunk) => {
+      clearTimeout(timer);
+      resolve(Number(String(chunk).trim()));
+    });
+  });
+  assert.ok(port > 0, "child should report its port");
+
+  await ensurePortFree(port);
+
+  assert.equal(child.exitCode, null, "an unrelated listener must survive port cleanup");
+  assert.equal(child.signalCode, null, "an unrelated listener must not be signalled");
 });

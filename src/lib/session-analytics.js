@@ -57,6 +57,8 @@ const wsl = require("./wsl-probe");
 // their union, deduping shared records while retaining divergent tails.
 // v12 fixes Grok's mutually exclusive token columns, retains exact reported
 // cost, and adds metadata-only usage diagnostics to the local session browser.
+// v12 retains Codex parent/subagent metadata locally and derives exact child
+// token totals from observed child rollouts instead of spawn-call estimates.
 const SIDECAR_VERSION = 12;
 const EDIT_TOOLS = new Set([
   "apply_patch",
@@ -519,6 +521,18 @@ async function scanCodexSession(filePath) {
     version: SIDECAR_VERSION,
     session_hash: sessionHash("codex", parsed.sessionId || primaryFilePath),
     session_id: parsed.sessionId || null,
+    // Local-only lineage. Codex v2 normally writes forked_from_id; keep
+    // parent_thread_id as a compatibility fallback, but reject disagreement.
+    parent_session_id: parsed.forkedFromId || parsed.parentThreadId || null,
+    parent_link_conflict: Boolean(
+      parsed.forkedFromId
+      && parsed.parentThreadId
+      && parsed.forkedFromId !== parsed.parentThreadId
+    ),
+    forked_from_id: parsed.forkedFromId || null,
+    thread_source: typeof parsed.threadSource === "string" ? parsed.threadSource : null,
+    agent_nickname: typeof parsed.agentNickname === "string" ? parsed.agentNickname : null,
+    agent_role: typeof parsed.agentRole === "string" ? parsed.agentRole : null,
     // Local-only: stripped in summarizeSessions before any cloud/CSV export.
     title,
     source: "codex",
@@ -849,7 +863,14 @@ function providerRoots(home, providerDir, env, deps = {}) {
   const discoverWslHome = deps.discoverWslHome || wsl.discoverWslHome;
   const roots = [];
   if (platform !== "win32" || wsl.shouldProbeNative(env)) {
-    roots.push(path.join(home, providerDir));
+    const useProcessCodexHome = providerDir === ".codex"
+      && path.resolve(home) === path.resolve(homedir())
+      && typeof env?.CODEX_HOME === "string"
+      && env.CODEX_HOME.trim();
+    const nativeRoot = useProcessCodexHome
+      ? path.resolve(env.CODEX_HOME.trim())
+      : path.join(home, providerDir);
+    roots.push(nativeRoot);
   }
   // Only the machine's own home has a WSL sibling worth probing.
   // discoverWslHome resolves \\wsl$ independently of `home`, so probing for an
@@ -1049,10 +1070,15 @@ function sessionFileStatKey(filePath) {
 const codexTitleIndexCache = new Map();
 
 function codexTitleIndexPathFor(filePath) {
-  const parts = path.resolve(filePath).split(path.sep);
-  const idx = parts.lastIndexOf(".codex");
-  if (idx === -1) return null;
-  return [...parts.slice(0, idx + 1), "session_index.jsonl"].join(path.sep);
+  let current = path.dirname(path.resolve(filePath));
+  while (true) {
+    if (["sessions", "archived_sessions"].includes(path.basename(current))) {
+      return path.join(path.dirname(current), "session_index.jsonl");
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
 }
 
 function loadCodexTitleIndex(filePath) {
@@ -1259,7 +1285,9 @@ function withinDayRange(row, from, to) {
 }
 
 function summarizeSessions(sessions, { from = "", to = "", includeSessions = true } = {}) {
-  const filtered = (sessions || []).filter((row) => withinDayRange(row, from, to));
+  const filtered = annotateCodexThreadUsage((sessions || [])
+    .filter((row) => withinDayRange(row, from, to))
+    .map((row) => ({ ...row })));
   const byModel = new Map();
   const subagents = new Map();
   for (const row of filtered) {
@@ -1288,6 +1316,26 @@ function summarizeSessions(sessions, { from = "", to = "", includeSessions = tru
       agg.edit_cost_usd += finite(row.cost_usd);
     }
     byModel.set(key, agg);
+    if (row.source === "codex" && row.parent_session_hash) {
+      const name = row.agent_role || row.agent_nickname || "subagent";
+      const sub = subagents.get(name) || {
+        name,
+        calls: 0,
+        sessions: 0,
+        total_tokens: 0,
+        cost_usd: 0,
+        attribution: "observed-child-session",
+      };
+      sub.calls += 1;
+      sub.sessions += 1;
+      sub.total_tokens += finite(row.total_tokens);
+      sub.cost_usd += finite(row.cost_usd);
+      subagents.set(name, sub);
+      continue;
+    }
+    // Codex child rollouts are first-class rows. A spawn call in the parent is
+    // a control-plane event, not token usage, so do not mix in an estimate.
+    if (row.source === "codex") continue;
     for (const [name, calls] of Object.entries(row.subagent_types || {})) {
       const sub = subagents.get(name) || { name, calls: 0, sessions: 0, total_tokens: 0, cost_usd: 0 };
       sub.calls += finite(calls);
@@ -1321,7 +1369,22 @@ function summarizeSessions(sessions, { from = "", to = "", includeSessions = tru
     // Git attribution and the local-only session browser, but never leave the
     // Node process through API/CSV payloads.
     sessions: includeSessions
-      ? filtered.map(({ project_ref: _projectRef, session_id: _sessionId, title: _title, _cache_key: _cacheKey, ...row }) => row)
+      ? filtered.map(({
+        project_ref: _projectRef,
+        session_id: _sessionId,
+        parent_session_id: _parentSessionId,
+        forked_from_id: _forkedFromId,
+        parent_session_hash: _parentSessionHash,
+        root_session_hash: _rootSessionHash,
+        agent_nickname: _agentNickname,
+        agent_role: _agentRole,
+        thread_source: _threadSource,
+        parent_link_conflict: _parentLinkConflict,
+        orphaned_subagent: _orphanedSubagent,
+        title: _title,
+        _cache_key: _cacheKey,
+        ...row
+      }) => row)
       : [],
     session_count: filtered.length,
     summary: {
@@ -1371,6 +1434,14 @@ function toSessionBrowserRow(row) {
   return {
     session_hash: row.session_hash,
     session_id: row.session_id || null,
+    parent_session_id: row.parent_session_id || null,
+    parent_session_hash: row.parent_session_hash || null,
+    root_session_hash: row.root_session_hash || row.session_hash,
+    thread_kind: row.parent_session_id ? "subagent" : "root",
+    agent_nickname: row.agent_nickname || null,
+    agent_role: row.agent_role || null,
+    orphaned_subagent: Boolean(row.orphaned_subagent),
+    parent_link_conflict: Boolean(row.parent_link_conflict),
     title: row.title || null,
     source: row.source,
     project_key: row.project_key,
@@ -1390,7 +1461,15 @@ function toSessionBrowserRow(row) {
     cache_creation_input_tokens: finite(tokens.cache_creation_input_tokens),
     output_tokens: finite(tokens.output_tokens),
     reasoning_output_tokens: finite(tokens.reasoning_output_tokens),
+    direct_subagent_count: finite(row.direct_subagent_count),
+    descendant_subagent_count: finite(row.descendant_subagent_count),
+    own_total_tokens: finite(row.total_tokens),
+    subagent_total_tokens: finite(row.subagent_total_tokens),
+    combined_total_tokens: finite(row.combined_total_tokens || row.total_tokens),
     total_tokens: finite(row.total_tokens),
+    own_cost_usd: finite(row.cost_usd),
+    subagent_cost_usd: finite(row.subagent_cost_usd),
+    combined_cost_usd: finite(row.combined_cost_usd || row.cost_usd),
     cost_usd: finite(row.cost_usd),
     cost_source: row.cost_source || null,
     usage_precision: row.usage_precision || null,
@@ -1456,6 +1535,14 @@ function mergeSessionFragments(rows) {
     cur.productive = Boolean(cur.productive) || Boolean(row.productive);
     cur.active_ms = finite(cur.active_ms) + finite(row.active_ms);
     if (!cur.title && row.title) cur.title = row.title;
+    if (!cur.parent_session_id && row.parent_session_id) cur.parent_session_id = row.parent_session_id;
+    if (cur.parent_session_id && row.parent_session_id && cur.parent_session_id !== row.parent_session_id) {
+      cur.parent_session_id = null;
+      cur.parent_link_conflict = true;
+    }
+    if (!cur.forked_from_id && row.forked_from_id) cur.forked_from_id = row.forked_from_id;
+    if (!cur.agent_nickname && row.agent_nickname) cur.agent_nickname = row.agent_nickname;
+    if (!cur.agent_role && row.agent_role) cur.agent_role = row.agent_role;
     // Representative model/project comes from the busiest fragment (most
     // tokens) so a tiny sidechain cannot overwrite the real coding model.
     if (finite(row.total_tokens) > finite(cur._repr_tokens)) {
@@ -1487,19 +1574,127 @@ function mergeSessionFragments(rows) {
   return merged;
 }
 
+// Attach exact Codex parent/child usage without changing the authoritative
+// per-session total_tokens field. Combined fields are derived views only, so
+// summing total_tokens across all rows still equals the global usage ledger.
+function annotateCodexThreadUsage(rows) {
+  const byId = new Map();
+  const childrenById = new Map();
+  const linkedParentById = new Map();
+
+  for (const row of rows || []) {
+    if (row?.source !== "codex" || typeof row.session_id !== "string" || !row.session_id) continue;
+    const existing = byId.get(row.session_id);
+    if (existing && existing !== row) {
+      existing.parent_link_conflict = true;
+      row.parent_link_conflict = true;
+      continue;
+    }
+    byId.set(row.session_id, row);
+  }
+
+  function hasParentCycle(start) {
+    const seen = new Set();
+    let current = start;
+    while (current?.parent_session_id && byId.has(current.parent_session_id)) {
+      if (seen.has(current.session_id) || current.parent_session_id === current.session_id) return true;
+      seen.add(current.session_id);
+      current = byId.get(current.parent_session_id);
+    }
+    return false;
+  }
+
+  for (const row of byId.values()) {
+    const parentId = typeof row.parent_session_id === "string" ? row.parent_session_id.trim() : "";
+    if (!parentId) continue;
+    if (row.parent_link_conflict || hasParentCycle(row)) {
+      row.parent_link_conflict = true;
+      continue;
+    }
+    if (!byId.has(parentId)) {
+      row.orphaned_subagent = true;
+      continue;
+    }
+    const children = childrenById.get(parentId) || [];
+    children.push(row);
+    childrenById.set(parentId, children);
+    linkedParentById.set(row.session_id, parentId);
+  }
+
+  const memo = new Map();
+  function aggregate(row, visiting = new Set()) {
+    if (memo.has(row.session_id)) return memo.get(row.session_id);
+    if (visiting.has(row.session_id)) {
+      row.parent_link_conflict = true;
+      return { count: 0, tokens: 0, cost: 0 };
+    }
+    const nextVisiting = new Set(visiting);
+    nextVisiting.add(row.session_id);
+    let count = 0;
+    let tokens = 0;
+    let cost = 0;
+    for (const child of childrenById.get(row.session_id) || []) {
+      const nested = aggregate(child, nextVisiting);
+      count += 1 + nested.count;
+      tokens += finite(child.total_tokens) + nested.tokens;
+      cost += finite(child.cost_usd) + nested.cost;
+    }
+    const result = { count, tokens, cost };
+    memo.set(row.session_id, result);
+    return result;
+  }
+
+  function rootFor(row) {
+    const seen = new Set([row.session_id]);
+    let current = row;
+    while (current && linkedParentById.has(current.session_id)) {
+      const linkedParentId = linkedParentById.get(current.session_id);
+      if (seen.has(linkedParentId)) {
+        row.parent_link_conflict = true;
+        break;
+      }
+      seen.add(linkedParentId);
+      current = byId.get(linkedParentId);
+    }
+    return current || row;
+  }
+
+  for (const row of rows || []) {
+    row.own_total_tokens = finite(row.total_tokens);
+    row.own_cost_usd = finite(row.cost_usd);
+    row.direct_subagent_count = row.source === "codex" && row.session_id
+      ? (childrenById.get(row.session_id) || []).length
+      : 0;
+    const nested = row.source === "codex" && row.session_id
+      ? aggregate(row)
+      : { count: 0, tokens: 0, cost: 0 };
+    row.descendant_subagent_count = nested.count;
+    row.subagent_total_tokens = nested.tokens;
+    row.subagent_cost_usd = nested.cost;
+    row.combined_total_tokens = finite(row.total_tokens) + nested.tokens;
+    row.combined_cost_usd = finite(row.cost_usd) + nested.cost;
+    if (row.source === "codex" && row.session_id) {
+      const parent = byId.get(linkedParentById.get(row.session_id));
+      row.parent_session_hash = parent?.session_hash || null;
+      row.root_session_hash = rootFor(row).session_hash || row.session_hash;
+    }
+  }
+  return rows;
+}
+
 // Local-only session list for the dashboard session browser. Unlike
 // summarizeSessions (cloud/CSV safe), this retains session_id + project_ref so
 // the UI can offer one-click resume. Callers must only expose it over the
 // local API.
 function listSessionsForBrowser(sessions, { from = "", to = "", limit = 0 } = {}) {
-  const filtered = mergeSessionFragments(sessions)
+  const filtered = annotateCodexThreadUsage(mergeSessionFragments(sessions)
     // Only sessions that actually spent tokens are worth listing. This drops
     // two kinds of noise: non-session logs under ~/.claude/projects
     // (skill-injections.jsonl, journal.jsonl, …), and sessions abandoned before
     // the model replied. Both render as "unknown · 0 tokens · $0.00" rows with
     // no model, no cost and nothing to analyze.
     .filter((row) => finite(row.total_tokens) > 0)
-    .filter((row) => withinDayRange(row, from, to));
+    .filter((row) => withinDayRange(row, from, to)));
   filtered.sort((a, b) => String(b.ended_at || "").localeCompare(String(a.ended_at || "")));
   const cap = Number(limit) > 0 ? Number(limit) : 0;
   const limited = cap > 0 ? filtered.slice(0, cap) : filtered;

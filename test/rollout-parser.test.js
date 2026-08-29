@@ -36,6 +36,7 @@ const {
   parseWslListVerbose,
   probeWslDistros,
   discoverWslHermesHome,
+  resolveCopilotOtelPaths,
   parseCopilotIncremental,
   parseKimiIncremental,
   parseCodebuddyIncremental,
@@ -73,6 +74,7 @@ const {
   resolveGooseDbPath,
   listRolloutFilesDeep,
   filterColdCodexRolloutFiles,
+  bucketKey,
 } = require("../src/lib/rollout");
 const { purgeProjectUsage } = require("../src/lib/project-usage-purge");
 
@@ -1359,6 +1361,48 @@ test("parseRolloutIncremental keeps project EOF fast path scoped to codex source
     assert.equal(second.eventsAggregated, 0);
     assert.equal(cursors.files[rolloutPath].projectOffset, undefined);
   } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("parseRolloutIncremental bounds concurrent metadata reads while preserving parse order", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-rollout-stat-"));
+  const realStat = fs.stat;
+  try {
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const rolloutFiles = [];
+    const cursors = { version: 1, files: {}, updatedAt: null };
+    for (let index = 0; index < 40; index += 1) {
+      const rolloutPath = path.join(tmp, `rollout-${String(index).padStart(2, "0")}.jsonl`);
+      await fs.writeFile(rolloutPath, "", "utf8");
+      const stat = await realStat(rolloutPath);
+      rolloutFiles.push(rolloutPath);
+      cursors.files[rolloutPath] = { inode: stat.ino || 0, offset: stat.size };
+    }
+
+    let inFlight = 0;
+    let maxInFlight = 0;
+    fs.stat = async function delayedStat(target, ...args) {
+      if (!rolloutFiles.includes(String(target))) {
+        return realStat.call(this, target, ...args);
+      }
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return await realStat.call(this, target, ...args);
+      } finally {
+        inFlight -= 1;
+      }
+    };
+
+    const result = await parseRolloutIncremental({ rolloutFiles, cursors, queuePath });
+    assert.equal(result.filesProcessed, 0);
+    assert.ok(maxInFlight > 1, `expected concurrent stat calls, observed ${maxInFlight}`);
+    assert.ok(maxInFlight <= 32, `stat concurrency must stay bounded, observed ${maxInFlight}`);
+    assert.deepEqual(Object.keys(cursors.files), rolloutFiles);
+  } finally {
+    fs.stat = realStat;
     await fs.rm(tmp, { recursive: true, force: true });
   }
 });
@@ -3144,6 +3188,221 @@ function fakeZcodeSqliteOptions(dbPath, messages) {
     stderr: { write() {} },
   };
 }
+
+function fakeNativeZcodeSqliteOptions(dbPath, usageRows, { completeSchema = true } = {}) {
+  const requiredColumns = [
+    "id", "logical_request_id", "attempt_index", "session_id", "provider_id", "model_id",
+    "status", "started_at", "input_tokens", "output_tokens", "reasoning_tokens",
+    "cache_creation_input_tokens", "cache_read_input_tokens",
+  ];
+  return {
+    execFileSync() {
+      throw new Error("spawn sqlite3 ENOENT");
+    },
+    requireFn(name) {
+      assert.equal(name, "node:sqlite");
+      return {
+        DatabaseSync: class FakeDatabaseSync {
+          constructor(actualDbPath, options) {
+            assert.equal(actualDbPath, dbPath);
+            assert.deepEqual(options, { readOnly: true });
+          }
+          prepare(sql) {
+            return {
+              all() {
+                if (sql.includes("pragma_table_info('model_usage')")) {
+                  const columns = completeSchema ? requiredColumns : requiredColumns.filter((c) => c !== "reasoning_tokens");
+                  return [
+                    ...columns.map((name) => ({ table_name: "model_usage", name })),
+                    { table_name: "session", name: "id" },
+                    { table_name: "session", name: "directory" },
+                  ];
+                }
+                if (/FROM model_usage/i.test(sql)) return usageRows;
+                if (/session_message/i.test(sql)) return [{ hasRows: 0, sessionTable: "session" }];
+                if (/FROM message/i.test(sql)) return [];
+                throw new Error(`unexpected SQL: ${sql}`);
+              },
+            };
+          }
+          close() {}
+        },
+      };
+    },
+    stderr: { write() {} },
+  };
+}
+
+test("readZcodeDbMessages prefers complete native model_usage rows and keeps token columns", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-zcode-native-"));
+  try {
+    const dbPath = path.join(tmp, "db.sqlite");
+    await fs.writeFile(dbPath, "", "utf8");
+    const rows = readZcodeDbMessages(dbPath, fakeNativeZcodeSqliteOptions(dbPath, [
+      {
+        id: "usage-1", logical_request_id: "logical-1", attempt_index: 0,
+        session_id: "session-1", provider_id: "builtin:zai-start-plan", model_id: "GLM-5.2",
+        started_at: Date.parse("2026-06-15T09:00:00.000Z"), input_tokens: 100,
+        output_tokens: 20, reasoning_tokens: 5, cache_creation_input_tokens: 10,
+        cache_read_input_tokens: 30, directory: "/work/project",
+      },
+      {
+        id: "usage-subagent", logical_request_id: "logical-2", attempt_index: 0,
+        session_id: "session-2", provider_id: "anthropic", model_id: "claude-opus-4-8",
+        started_at: Date.parse("2026-06-15T09:01:00.000Z"), input_tokens: 999,
+        output_tokens: 99, reasoning_tokens: 0, cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0, directory: "/work/project",
+      },
+    ]));
+
+    assert.equal(rows.length, 1, "bundled Claude/Codex/Gemini providers remain excluded");
+    assert.equal(rows[0].id, "usage-1");
+    assert.equal(rows[0].sessionID, "session-1");
+    assert.equal(rows[0].data.modelID, "GLM-5.2");
+    assert.equal(rows[0].data.providerID, "builtin:zai-start-plan");
+    assert.deepEqual(rows[0].data.tokens, {
+      input: 60,
+      output: 15,
+      reasoning: 5,
+      cache: { read: 30, write: 10 },
+    });
+    assert.equal(rows[0].data.path.cwd, "/work/project");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("readZcodeDbMessages falls back when model_usage schema is incomplete", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-zcode-native-fallback-"));
+  try {
+    const dbPath = path.join(tmp, "db.sqlite");
+    await fs.writeFile(dbPath, "", "utf8");
+    const rows = readZcodeDbMessages(
+      dbPath,
+      fakeNativeZcodeSqliteOptions(dbPath, [], { completeSchema: false }),
+    );
+    assert.deepEqual(rows, []);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("readZcodeDbMessages queries a real native schema and ignores unfinished requests", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-zcode-native-sql-"));
+  try {
+    const dbPath = path.join(tmp, "db.sqlite");
+    runSqliteWrite(dbPath, `
+      CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL);
+      CREATE TABLE model_usage (
+        id TEXT PRIMARY KEY,
+        logical_request_id TEXT NOT NULL,
+        attempt_index INTEGER NOT NULL DEFAULT 0,
+        session_id TEXT NOT NULL,
+        provider_id TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_input_tokens INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO session VALUES ('session-real', '/real/project');
+      INSERT INTO model_usage VALUES
+        ('done', 'logical-done', 0, 'session-real', 'builtin:zai-start-plan', 'GLM-5.2',
+         'completed', 1781514000000, 101, 21, 6, 11, 31),
+        ('running', 'logical-running', 0, 'session-real', 'builtin:zai-start-plan', 'GLM-5.2',
+         'running', 1781514060000, 999, 99, 0, 0, 0);
+    `);
+
+    const rows = readZcodeDbMessages(dbPath);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].id, "done");
+    assert.equal(rows[0].data.path.cwd, "/real/project");
+    assert.deepEqual(rows[0].data.tokens, {
+      input: 59,
+      output: 15,
+      reasoning: 6,
+      cache: { read: 31, write: 11 },
+    });
+
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const cursors = { version: 1, files: {}, updatedAt: null };
+    const first = await parseOpencodeDbIncremental({
+      dbMessages: rows,
+      dbPath,
+      cursors,
+      queuePath,
+      source: "zcode",
+      cursorKey: "zcode",
+    });
+    assert.equal(first.bucketsQueued, 1);
+    const [queued] = await readJsonLines(queuePath);
+    assert.equal(queued.source, "zcode");
+    assert.equal(queued.input_tokens, 59);
+    assert.equal(queued.output_tokens, 15);
+    assert.equal(queued.reasoning_output_tokens, 6);
+    assert.equal(queued.cached_input_tokens, 31);
+    assert.equal(queued.cache_creation_input_tokens, 11);
+    assert.equal(queued.total_tokens, 122);
+
+    const beforeSecondRun = await fs.readFile(queuePath, "utf8");
+    const second = await parseOpencodeDbIncremental({
+      dbMessages: readZcodeDbMessages(dbPath),
+      dbPath,
+      cursors,
+      queuePath,
+      source: "zcode",
+      cursorKey: "zcode",
+    });
+    assert.equal(second.bucketsQueued, 0);
+    assert.equal(await fs.readFile(queuePath, "utf8"), beforeSecondRun);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("readZcodeDbMessages snapshots native model_usage DBs on UNC paths", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-zcode-native-unc-"));
+  try {
+    const dbPath = path.join(tmp, "db.sqlite");
+    runSqliteWrite(dbPath, `
+      CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL);
+      CREATE TABLE model_usage (
+        id TEXT PRIMARY KEY,
+        logical_request_id TEXT NOT NULL,
+        attempt_index INTEGER NOT NULL DEFAULT 0,
+        session_id TEXT NOT NULL,
+        provider_id TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_input_tokens INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO session VALUES ('session-unc', '/unc/project');
+      INSERT INTO model_usage VALUES
+        ('usage-unc', 'logical-unc', 0, 'session-unc', 'builtin:zai-start-plan', 'GLM-5.2',
+         'completed', 1781514000000, 80, 20, 5, 10, 20);
+    `);
+    const uncStyle = process.platform === "win32" ? `\\\\?\\${dbPath}` : `/${dbPath}`;
+    const rows = readZcodeDbMessages(uncStyle);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].id, "usage-unc");
+    assert.deepEqual(rows[0].data.tokens, {
+      input: 50,
+      output: 15,
+      reasoning: 5,
+      cache: { read: 20, write: 10 },
+    });
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
 
 test("readZcodeDbMessages keeps Z.ai/BigModel + third-party rows, drops bundled sub-agent turns", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-zcode-db-"));
@@ -5857,6 +6116,36 @@ function makeCopilotChatAttrs({
   return attrs;
 }
 
+test("resolveCopilotOtelPaths discovers both Copilot default locations", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-copilot-paths-"));
+  try {
+    const cliDir = path.join(tmp, ".copilot", "otel");
+    const chatDir = path.join(tmp, ".copilot-otel");
+    const explicitPath = path.join(tmp, "custom", "copilot.jsonl");
+    await fs.mkdir(cliDir, { recursive: true });
+    await fs.mkdir(chatDir, { recursive: true });
+    await fs.mkdir(path.dirname(explicitPath), { recursive: true });
+    await fs.writeFile(path.join(cliDir, "cli.jsonl"), "", "utf8");
+    await fs.writeFile(path.join(chatDir, "copilot.jsonl"), "", "utf8");
+    await fs.writeFile(path.join(cliDir, "ignored.txt"), "", "utf8");
+    await fs.writeFile(explicitPath, "", "utf8");
+
+    assert.deepEqual(
+      resolveCopilotOtelPaths({
+        HOME: tmp,
+        COPILOT_OTEL_FILE_EXPORTER_PATH: explicitPath,
+      }),
+      [
+        path.join(tmp, ".copilot", "otel", "cli.jsonl"),
+        path.join(tmp, ".copilot-otel", "copilot.jsonl"),
+        explicitPath,
+      ].sort(),
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 function makeCopilotChatSpan({
   traceId = "trace-a",
   spanId = "span-1",
@@ -6114,6 +6403,119 @@ test("parseCopilotIncremental handles Chat extension LogRecord shape (hrTime + r
   }
 });
 
+test("parseCopilotIncremental does not merge Chat records that share spanContext", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-copilot-shared-context-"));
+  try {
+    const otelPath = path.join(tmp, "vscode-chat.jsonl");
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const first = makeCopilotChatLogRecord({
+      responseId: "shared-context-r1",
+      inputTokens: 500,
+      outputTokens: 50,
+      cacheRead: 0,
+    });
+    const second = makeCopilotChatLogRecord({
+      responseId: "shared-context-r2",
+      inputTokens: 800,
+      outputTokens: 90,
+      cacheRead: 0,
+    });
+    first.spanContext = { traceId: "shared-trace", spanId: "shared-span" };
+    second.spanContext = { traceId: "shared-trace", spanId: "shared-span" };
+    writeCopilotOtelFile(otelPath, [first, second]);
+
+    const result = await parseCopilotIncremental({
+      otelPaths: [otelPath],
+      cursors: {},
+      queuePath,
+    });
+    assert.equal(result.eventsAggregated, 2);
+
+    const buckets = (await readJsonLines(queuePath)).filter(
+      (entry) => entry.source === "copilot",
+    );
+    assert.equal(buckets.length, 1);
+    assert.equal(buckets[0].input_tokens, 1300);
+    assert.equal(buckets[0].output_tokens, 140);
+    assert.equal(buckets[0].conversation_count, 2);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("parseCopilotIncremental repairs v2 Chat deduplication before upgrading the cursor", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-copilot-v2-migration-"));
+  try {
+    const otelPath = path.join(tmp, "vscode-chat.jsonl");
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const first = makeCopilotChatLogRecord({
+      responseId: "v2-shared-r1",
+      inputTokens: 500,
+      outputTokens: 50,
+      cacheRead: 0,
+    });
+    const second = makeCopilotChatLogRecord({
+      responseId: "v2-shared-r2",
+      inputTokens: 800,
+      outputTokens: 90,
+      cacheRead: 0,
+    });
+    first.spanContext = { traceId: "v2-shared-trace", spanId: "v2-shared-span" };
+    second.spanContext = { traceId: "v2-shared-trace", spanId: "v2-shared-span" };
+    writeCopilotOtelFile(otelPath, [first, second]);
+    const stat = fssync.statSync(otelPath);
+    const model = "gpt-4o-mini-2024-07-18";
+    const hourStart = "2026-05-13T03:00:00.000Z";
+    const oldTotals = {
+      input_tokens: 500,
+      cached_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      output_tokens: 50,
+      reasoning_output_tokens: 0,
+      total_tokens: 550,
+      billable_total_tokens: 550,
+      conversation_count: 1,
+    };
+    const cursors = {
+      copilot: {
+        version: 2,
+        seenIds: ["v2-shared-trace:v2-shared-span"],
+        fileOffsets: {
+          [otelPath]: { size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino },
+        },
+      },
+      hourly: {
+        version: 3,
+        buckets: {
+          [bucketKey("copilot", model, hourStart)]: {
+            totals: oldTotals,
+            queuedKey: null,
+          },
+        },
+        groupQueued: {},
+      },
+    };
+
+    const result = await parseCopilotIncremental({
+      otelPaths: [otelPath],
+      cursors,
+      queuePath,
+    });
+    assert.equal(result.eventsAggregated, 0, "the historical prefix is repaired during migration");
+    assert.equal(cursors.copilot.version, 3);
+
+    const [bucket] = (await readJsonLines(queuePath)).filter(
+      (entry) => entry.source === "copilot",
+    );
+    assert.equal(bucket.input_tokens, 1300);
+    assert.equal(bucket.output_tokens, 140);
+    assert.equal(bucket.total_tokens, 1440);
+    assert.equal(bucket.conversation_count, 2);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test("parseCopilotIncremental reads short cache_creation + reasoning_tokens keys (Chat extension)", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-copilot-"));
   try {
@@ -6213,7 +6615,7 @@ test("parseCopilotIncremental migration: v1 cursor with empty seenIds + non-empt
 
     const result = await parseCopilotIncremental({ otelPaths: [otelPath], cursors, queuePath });
     assert.equal(result.eventsAggregated, 2, "migration should re-read both records");
-    assert.equal(cursors.copilot.version, 2, "version should be bumped");
+    assert.equal(cursors.copilot.version, 3, "version should be bumped");
 
     const queued = await readJsonLines(queuePath);
     const b = queued.find((r) => r.source === "copilot");
@@ -6255,7 +6657,7 @@ test("parseCopilotIncremental migration: preserves CLI fileOffsets (no re-read o
       0,
       "CLI file should be skipped entirely (offset === size after migration)",
     );
-    assert.equal(cursors.copilot.version, 2);
+    assert.equal(cursors.copilot.version, 3);
     // Offset preserved (within tolerance for fresh stat) — confirms no full re-read happened
     assert.equal(
       cursors.copilot.fileOffsets[otelPath].size,

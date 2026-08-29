@@ -198,7 +198,7 @@ test("leaderboard refresh reconciles stale rows after the replacement snapshot i
   );
 });
 
-test("leaderboard anti-cheat workflow verifies database-native scans, refreshes, and never leaks identities", () => {
+test("leaderboard anti-cheat workflow verifies database-native scans, reconciles exclusions, and never leaks identities", () => {
   const workflow = read(".github/workflows/leaderboard-anticheat.yml");
   assert.match(
     workflow,
@@ -218,10 +218,15 @@ test("leaderboard anti-cheat workflow verifies database-native scans, refreshes,
   );
   assert.match(workflow, /last_scan_completed_at/u);
   assert.match(workflow, /scan_age_seconds/u);
-  assert.match(workflow, /force_refresh\\":true/u);
-  assert.match(workflow, /--retry 2 --retry-delay 3 --retry-max-time 90 --retry-all-errors/u,
-    "the remote refresh must absorb one transient edge/database failure");
-  assert.match(workflow, /for period in week month total/u);
+  assert.doesNotMatch(workflow, /force_refresh\\":true/u,
+    "anti-cheat response must not rebuild every leaderboard snapshot");
+  assert.match(workflow, /anti_cheat_reconcile_at/u,
+    "the responder must use the atomic exclusion reconciliation path");
+  assert.doesNotMatch(workflow, /for period in week month total/u,
+    "the responder must not fan one queue change out into three heavy refreshes");
+  const postBranch = workflow.slice(workflow.indexOf('if [[ "$method" == "GET" ]]'));
+  assert.doesNotMatch(postBranch.slice(postBranch.indexOf("else")), /--retry-all-errors/u,
+    "write requests must not overlap after a lost gateway response");
   assert.match(workflow, /\?anomalies=1/u, "the workflow must independently read back queue state");
   assert.doesNotMatch(workflow, /user_id/u, "workflow logs must never expose flagged identities");
   assert.match(
@@ -251,23 +256,41 @@ test("anti-cheat health reports database-native scan freshness before protected 
   assert.match(source, /return json\(\{ ok: true, results, \.\.\.\(anomalyScan \? \{ scan: anomalyScan \} : \{\}\) \}\)/u);
 });
 
-test("anti-cheat responder rebuilds snapshots only when the moderation queue changed", () => {
+test("database-native anti-cheat detector has a bounded hourly scan budget", () => {
+  const migration = readMigrationBySuffix("bound-anticheat-detector-window");
+  const runtime = read("docs/ops/leaderboard-anomaly-detector-runtime.sql");
+
+  assert.match(migration, /SET value = 1\s+WHERE key = 'lookback_days'/u,
+    "an hourly detector must not rescan two weeks of raw event and ingestion history");
+  assert.match(migration, /missing anti-cheat lookback_days configuration/u,
+    "deployment must fail instead of silently leaving the unbounded configuration in place");
+  assert.match(runtime, /ALTER FUNCTION public\.detect_leaderboard_anomalies\(\)\s+SET work_mem TO '16MB'/u,
+    "one detector query must not retain the old 64MB per-operation memory budget");
+  assert.match(runtime, /SET statement_timeout TO '45s'/u,
+    "a runaway detector must fail closed before it destabilizes the database server");
+});
+
+test("anti-cheat responder atomically reconciles snapshots only when the moderation queue changed", () => {
   const workflow = read(".github/workflows/leaderboard-anticheat.yml");
   const source = read("dashboard/edge-patches/tokentracker-leaderboard-refresh.ts");
-  const migration = read("migrations/20260812122500_track-anticheat-response-state.sql");
+  const migration = readMigrationBySuffix("reconcile-anticheat-snapshot-exclusions");
 
   assert.match(workflow, /last_queue_changed_at/u);
   assert.match(workflow, /last_response_completed_at/u);
   assert.match(workflow, /needs_response/u,
-    "unchanged queues must not force the same expensive snapshot rebuild every hour");
-  assert.match(workflow, /anti_cheat_response_completed_at/u,
-    "a successful multi-period rebuild must atomically acknowledge the queue version it applied");
-  assert.match(source, /mark_anticheat_response_completed/u);
-  assert.match(migration, /last_queue_changed_at/u);
-  assert.match(migration, /last_response_completed_at/u);
-  assert.match(migration, /AFTER INSERT OR DELETE OR UPDATE OF status/u);
-  assert.match(migration, /FOR EACH ROW/u,
-    "a zero-row detector pass must not pretend the moderation queue changed");
+    "unchanged queues must not repeat snapshot reconciliation every hour");
+  assert.match(workflow, /anti_cheat_reconcile_at/u);
+  assert.match(workflow, /reconcile request failed; checking durable database state/u,
+    "a lost HTTP response must fall through to durable state read-back");
+  assert.match(source, /reconcile_anticheat_snapshot_exclusions/u);
+  assert.match(source, /reconciled_snapshot_rows/u);
+  assert.match(migration, /FOR UPDATE/u,
+    "queue reconciliation must serialize against detector queue changes");
+  assert.match(migration, /f\.status IN \('auto_excluded', 'banned'\)/u);
+  assert.match(migration, /SET last_response_completed_at = p_queue_changed_at/u,
+    "snapshot deletion and queue acknowledgement must commit atomically");
+  assert.match(migration, /REVOKE ALL ON FUNCTION public\.reconcile_anticheat_snapshot_exclusions/u);
+  assert.match(migration, /GRANT EXECUTE ON FUNCTION public\.reconcile_anticheat_snapshot_exclusions/u);
 });
 
 test("leaderboard bans block token issuance and usage ingestion", () => {

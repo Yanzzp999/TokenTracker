@@ -58,6 +58,12 @@ export const PROVIDER_LIMIT_SPECS = {
           window: data.tertiary_window,
           windowSecondsField: "limit_window_seconds",
         },
+        {
+          key: "grok-bot",
+          labelKey: "limits.label.cursor_grok_bot",
+          window: data.quaternary_window,
+          windowSecondsField: "limit_window_seconds",
+        },
       ];
     },
   },
@@ -219,6 +225,7 @@ export function usageLimitsLabelCopyAnchor() {
     copy("limits.label.cursor_plan"),
     copy("limits.label.cursor_auto"),
     copy("limits.label.cursor_api"),
+    copy("limits.label.cursor_grok_bot"),
     copy("limits.label.gemini_pro"),
     copy("limits.label.gemini_flash"),
     copy("limits.label.gemini_lite"),

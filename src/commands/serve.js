@@ -334,9 +334,15 @@ function startNativeBackgroundSync({
   };
 }
 
+// `-sTCP:LISTEN` matters: `lsof -i tcp:<port>` matches any socket with that
+// port as its LOCAL *or* REMOTE endpoint, so without it a browser merely
+// connected to the dashboard is reported alongside the server that owns it.
 function findPidOnPort(port) {
   try {
-    const out = cp.execFileSync("lsof", ["-ti", `tcp:${port}`], { encoding: "utf8", timeout: 5000 });
+    const out = cp.execFileSync("lsof", ["-ti", `tcp:${port}`, "-sTCP:LISTEN"], {
+      encoding: "utf8",
+      timeout: 5000,
+    });
     const pids = out.trim().split(/\s+/).map(Number).filter((n) => Number.isFinite(n) && n > 0);
     return pids;
   } catch (_e) {
@@ -344,13 +350,113 @@ function findPidOnPort(port) {
   }
 }
 
+function readProcessCommand(pid) {
+  try {
+    return cp
+      .execFileSync("ps", ["-p", String(pid), "-o", "command="], {
+        encoding: "utf8",
+        timeout: 5000,
+      })
+      .trim();
+  } catch (_e) {
+    return "";
+  }
+}
+
+// A TokenTracker server is always `node <somewhere>/bin/<entry> serve`: either
+// the real script (npm global, embedded desktop runtime, repo checkout) or one
+// of the published npm bin shims, which `ps` reports by the shim path rather
+// than the resolved script. Requiring the `bin/` component keeps an unrelated
+// `node /srv/other/tracker.js serve` from looking like ours.
+const TRACKER_ENTRY_RE = new RegExp(
+  String.raw`(?:^|[\\/])\.?bin[\\/](?:tracker\.js|tokentracker-cli|tokentracker-tracker|tokentracker|tracker)$`,
+  "i",
+);
+const NODE_EXECUTABLE_RE = /(?:^|[\\/])node(?:\.exe)?$/i;
+// Every `serve` token that could be the subcommand rather than part of a path.
+const SERVE_BOUNDARY_RE = /\s+serve(?=\s|$)/g;
+
+// The tracker entry path a `node ... serve` command would run, or null.
+//
+// `ps -o command=` joins argv with spaces and drops all quoting, so the script
+// path is only delimited by the `serve` argument after it -- splitting on
+// whitespace would reject an install under `~/Token Tracker/`. But `serve` can
+// occur inside the install path too, so every boundary is tried and the one
+// whose prefix is actually a tracker entry wins; taking the first would parse
+// `~/my serve dir/bin/tracker.js` as `~/my`.
+function parseServeScriptPath(command) {
+  const value = String(command || "").replaceAll("\0", " ").trim();
+  if (!value) return null;
+
+  const executable = /^\S+(?=\s)/.exec(value);
+  if (!executable || !NODE_EXECUTABLE_RE.test(executable[0])) return null;
+  const rest = value.slice(executable[0].length);
+
+  SERVE_BOUNDARY_RE.lastIndex = 0;
+  for (let match = SERVE_BOUNDARY_RE.exec(rest); match; match = SERVE_BOUNDARY_RE.exec(rest)) {
+    const candidate = rest
+      .slice(0, match.index)
+      .trim()
+      .replace(/^["']/, "")
+      .replace(/["']$/, "");
+    if (TRACKER_ENTRY_RE.test(candidate)) return candidate;
+  }
+  return null;
+}
+
+// How far above the entry script a package.json may sit. `bin/tracker.js` puts
+// it one level up; the npm bin shims resolve into
+// `node_modules/<pkg>/bin/tracker.js`, which is the same shape.
+const TRACKER_PACKAGE_SEARCH_DEPTH = 3;
+
+function isTrackerPackageRoot(dir) {
+  try {
+    const manifest = JSON.parse(fssync.readFileSync(path.join(dir, "package.json"), "utf8"));
+    return manifest?.name === NPM_PACKAGE_NAME;
+  } catch (_e) {
+    return false;
+  }
+}
+
+// The path shape alone is not identifying: plenty of unrelated projects ship a
+// `bin/tracker.js`, and matching on that would signal one of them. Resolve the
+// script and require a real `${NPM_PACKAGE_NAME}` package around it.
+//
+// Fails closed. A server whose script cannot be resolved -- deleted, or in a
+// mount namespace this process cannot read -- is left alone, so the worst case
+// is a failed bind rather than a killed stranger.
+function isTokenTrackerServeCommand(command) {
+  const script = parseServeScriptPath(command);
+  if (!script) return false;
+
+  let resolved;
+  try {
+    resolved = fssync.realpathSync(script);
+  } catch (_e) {
+    return false;
+  }
+
+  let dir = path.dirname(path.dirname(resolved));
+  for (let depth = 0; depth < TRACKER_PACKAGE_SEARCH_DEPTH; depth++) {
+    if (isTrackerPackageRoot(dir)) return true;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return false;
+}
+
 async function ensurePortFree(port) {
   const pids = findPidOnPort(port);
   if (pids.length === 0) return;
 
-  // Don't kill ourselves
+  // Only stop a verified TokenTracker server. `--port` may name a port owned by
+  // an unrelated application, and failing to bind is far safer than terminating
+  // a process merely because it happens to hold that port.
   const self = process.pid;
-  const targets = pids.filter((p) => p !== self);
+  const targets = pids.filter(
+    (pid) => pid !== self && isTokenTrackerServeCommand(readProcessCommand(pid)),
+  );
   if (targets.length === 0) return;
 
   process.stdout.write(`Stopping previous server on port ${port} (pid ${targets.join(", ")})...\n`);
@@ -366,8 +472,10 @@ async function ensurePortFree(port) {
     if (findPidOnPort(port).length === 0) return;
   }
 
-  // Force kill if still alive
+  // Re-check identity before escalating: the pid may have exited during the
+  // wait above and been recycled by an unrelated process.
   for (const pid of targets) {
+    if (!isTokenTrackerServeCommand(readProcessCommand(pid))) continue;
     try {
       process.kill(pid, "SIGKILL");
     } catch (_e) {}
@@ -538,7 +646,10 @@ module.exports = {
   listenOnAvailablePort,
   getLocalServerUrl,
   parseArgs,
+  ensurePortFree,
   isRunningUnderWsl,
+  isTokenTrackerServeCommand,
+  parseServeScriptPath,
   resolveDefaultPort,
   shouldServeSpaFallback,
   startNativeBackgroundSync,

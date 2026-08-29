@@ -201,7 +201,7 @@ brew install xiufengsun/tokentracker/tokentracker
 | **AnythingLLM Desktop** | ✅ 自动 | 被动 SQLite 读取（`anythingllm-desktop/storage/anythingllm.db`；只读取每条消息的 token 指标，不读取 prompt 或回复） |
 | **Claude Science** | ✅ 自动 | 被动 SQLite 读取（`~/.claude-science/operon-cli.db`；只读取 `frames` 表的 token 计数，不读取 prompt、产物或研究内容）。没有原生 Windows 版——Windows 上该应用运行在 WSL 内，从 WSL 中读取。 |
 | **DeepSeek Harness** | ✅ 自动 | 被动读取会话日志（`~/.dsh/sessions/**/session.jsonl[.zstd]`；解析会话头部与 assistant 事件，支持多帧 zstd 解压） |
-| **TRAE Work CN** | ✅ 自动 | **需要显式开启：设置 `TOKENTRACKER_TRAE_CN_USAGE=1`。** 读取用量会把本地保存的登录授权发送到 TRAE 的内部 API，因此在你开启之前不会发出任何请求。开启后：仅在存在本地 TRAE Work CN 登录授权的可执行非后台同步期间，读取 macOS 本地登录应用的 session-token 用量；内部 API 可能变化 |
+| **TRAE Work CN** | ✅ 自动 | **需要显式开启：设置 `TOKENTRACKER_TRAE_CN_USAGE=1`。** 读取用量会把本地保存的登录授权发送到 TRAE 的内部 API，因此在你开启之前不会发出任何请求。开启后：仅在存在本地 TRAE Work CN 登录授权的可执行非后台同步期间，读取 macOS / Windows 本地登录应用的 session-token 用量；内部 API 可能变化 |
 
 > **需要手动装什么插件 / hook 吗？** 不需要。`tokentracker`（或 `tokentracker init`）第一次跑的时候会全部搞定：
 > - **基于 hook 的工具**（Claude Code、Codex、Gemini、Every Code、**CodeBuddy**、**WorkBuddy**、**Grok Build**）—— 我们把 SessionEnd hook 或 TOML notify 条目写入它们自己的配置文件
@@ -260,7 +260,7 @@ flowchart LR
 | **不上传内容** | 只记录 token 数量和时间戳。**绝不**记录 prompt、回复或文件内容 |
 | **默认纯本地** | 所有数据保留在你的机器上。排行榜是完全 opt-in |
 | **可审计** | 代码开源。[`src/lib/rollout.js`](src/lib/rollout.js) 里只有数字和时间戳 |
-| **仅匿名使用统计** | 只有两类匿名上报：(1) 每天最多一次的心跳——机器 ID 的单向哈希、应用版本、操作系统平台、运行形态（cli/mac/win）；(2) 匿名的 dashboard 页面/功能事件（PostHog——已关闭 autocapture 和会话录制，尊重浏览器 Do-Not-Track）。绝不包含 token 数量、模型名、prompt 或路径。可在 [`src/lib/telemetry.js`](src/lib/telemetry.js) 与 [`dashboard/src/lib/analytics.js`](dashboard/src/lib/analytics.js) 审计；一个开关同时关闭两者：`TOKENTRACKER_NO_TELEMETRY=1`（或 `DO_NOT_TRACK=1`） |
+| **仅匿名使用统计** | 只有两类匿名上报：(1) 每天最多一次的心跳——机器 ID 的单向哈希、应用版本、操作系统平台、运行形态（cli/macos/windows/linux）；(2) 匿名的 dashboard 页面/功能事件（PostHog——已关闭 autocapture 和会话录制，尊重浏览器 Do-Not-Track）。绝不包含 token 数量、模型名、prompt 或路径。可在 [`src/lib/telemetry.js`](src/lib/telemetry.js) 与 [`dashboard/src/lib/analytics.js`](dashboard/src/lib/analytics.js) 审计；一个开关同时关闭两者：`TOKENTRACKER_NO_TELEMETRY=1`（或 `DO_NOT_TRACK=1`） |
 
 ---
 

@@ -102,6 +102,7 @@
   "limits.panel.title": "Nutzungslimits",
   "limits.panel.mode_separator": " · ",
   "limits.label.cursor_plan": "Plan",
+  "limits.label.cursor_grok_bot": "Grok-Bot",
   "limits.label.cursor_auto": "Auto",
   "limits.label.cursor_api": "API",
   "limits.label.kiro_month": "Monatlich",
@@ -522,6 +523,14 @@
   "sessions.grok.token_breakdown": "Eingabe {{input}} · Cache-Lesen {{cacheRead}} · Cache-Schreiben {{cacheWrite}} · Ausgabe {{output}} · Reasoning {{reasoning}}",
   "sessions.grok.runtime_breakdown": "Modellaufrufe {{calls}} · API {{seconds}} s · Tools {{tools}} · Fehler {{errors}}",
   "sessions.grok.context_breakdown": "Kontext {{used}} / {{window}} ({{percent}} %)",
+  "sessions.badge.subagent": "Subagent",
+  "sessions.thread.expand": "{{count}} Subagents anzeigen",
+  "sessions.thread.collapse": "{{count}} Subagents einklappen",
+  "sessions.thread.tokens_summary": "Eigen {{own}} · Subagents {{subagents}} · Gesamt {{combined}}",
+  "sessions.thread.result_count": "{{roots}} Hauptsitzungen · {{subagents}} Subagents eingeklappt",
+  "sessions.thread.model_usage": "Modellnutzung der Subagents",
+  "sessions.thread.model_all": "Alle · {{count}} Agenten · {{tokens}}",
+  "sessions.thread.model_item": "{{model}} · {{count}} Agenten · {{tokens}}",
   "sessions.duration.minutes": "{{minutes}} Min.",
   "sessions.duration.hours": "{{hours}} Std. {{minutes}} Min.",
   "sessions.project.unknown": "Unbenannte Sitzung",
@@ -552,5 +561,7 @@
   "limits.alert.title": "{{provider}}-Limit könnte vorzeitig aufgebraucht sein",
   "limits.alert.body": "Beim aktuellen Tempo könnte das Kontingent in {{eta}} aufgebraucht sein ({{percent}}% verbraucht).",
   "settings.section.labs": "Labs",
-  "limits.alert.blocked": "Benachrichtigungen sind aus – in den Systemeinstellungen erlauben"
+  "limits.alert.blocked": "Benachrichtigungen sind aus – in den Systemeinstellungen erlauben",
+  "settings.limits.showSubscriptions": "Abos in Limits anzeigen",
+  "settings.limits.showSubscriptionsHint": "Zeige manuell eingetragene Abo-Verlängerungen zusammen mit den Limits an."
 }

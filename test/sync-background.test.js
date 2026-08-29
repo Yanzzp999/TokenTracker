@@ -414,6 +414,37 @@ test("all-local background sync includes Reasonix telemetry", async () => {
   });
 });
 
+test("all-local background sync refreshes Cursor while default background stays offline", async () => {
+  await withTempSyncEnv(async (home) => {
+    let fetchCalls = 0;
+    const csvText = `Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost
+"2026-06-30T10:15:00.000Z","Included","composer-2-fast","No","120","100","30","40","190","0.01"`;
+    const context = {
+      cursorSyncDeps: {
+        isInstalled: () => true,
+        extractAuth: () => ({ cookie: "WorkosCursorSessionToken=test", userId: "user_test" }),
+        fetchUsageCsv: async () => {
+          fetchCalls += 1;
+          return csvText;
+        },
+      },
+    };
+
+    await cmdSync(["--auto", "--background"], context);
+    assert.equal(fetchCalls, 0, "ordinary background sync must remain local-only");
+
+    await cmdSync(["--auto", "--background", "--all-local-sources"], context);
+    assert.equal(fetchCalls, 1, "explicit all-local background sync must honor Cursor");
+    const firstQueue = await readQueue(home);
+    assert.match(firstQueue, /"source":"cursor"/);
+    assert.match(firstQueue, /"model":"composer-2-fast"/);
+
+    await cmdSync(["--auto", "--background", "--all-local-sources"], context);
+    assert.equal(fetchCalls, 2);
+    assert.equal(await readQueue(home), firstQueue, "the repeated full-history CSV is idempotent");
+  });
+});
+
 test("default background auto sync includes Reasonix telemetry", async () => {
   await withTempSyncEnv(async (home) => {
     await writeReasonixTelemetry(home, "reasonix-default-background");

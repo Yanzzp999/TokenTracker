@@ -51,6 +51,7 @@ class DashboardViewModel: ObservableObject {
     @Published var modelBreakdown: ModelBreakdownResponse?
     @Published var projectUsage: ProjectUsageResponse?
     @Published var usageLimits: UsageLimitsResponse? = UsageLimitsCache.load()
+    @Published var subscriptions: [SubscriptionRecord] = []
 
     @Published var isLoading = false
     @Published var isSyncing = false
@@ -155,7 +156,7 @@ class DashboardViewModel: ObservableObject {
 
         var errorCount = 0
         var firstError: String?
-        let totalFetches = 9
+        let totalFetches = 10
 
         await withTaskGroup(of: Void.self) { group in
             // Today summary (always today for summary cards)
@@ -284,6 +285,9 @@ class DashboardViewModel: ObservableObject {
             // response are still respected by the view (those providers are hidden).
             group.addTask { @MainActor in
                 await self.refreshUsageLimits()
+            }
+            group.addTask { @MainActor in
+                await self.refreshSubscriptions()
             }
         }
 
@@ -598,6 +602,7 @@ class DashboardViewModel: ObservableObject {
         guard !pendingFullRefreshAfterHiddenRefresh,
               !isPopoverVisible else { return }
         await refreshUsageLimits()
+        await refreshSubscriptions()
     }
 
     private func finishHiddenRefresh() async {
@@ -757,6 +762,15 @@ class DashboardViewModel: ObservableObject {
             Self.logger.error("Usage limits refresh failed: \(error.localizedDescription, privacy: .public)")
         }
         scheduleResetBoundaryRefresh(for: usageLimits)
+    }
+
+    private func refreshSubscriptions() async {
+        do {
+            let subs = try await APIClient.shared.fetchSubscriptions()
+            self.subscriptions = subs
+        } catch {
+            Self.logger.error("Subscriptions refresh failed: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     /// Wake up just after the soonest upcoming boundary and re-fetch limits, instead

@@ -117,6 +117,36 @@ const response = {
   ],
 };
 
+const makeThreadSession = (overrides) => ({
+  ...response.sessions[1],
+  session_hash: "thread-row",
+  session_id: "00000000-0000-4000-8000-000000000000",
+  title: "Thread session",
+  source: "codex",
+  project_key: "thread-fixture",
+  project_ref: "/work/thread-fixture",
+  model: "gpt-5.6-sol",
+  parent_session_id: null,
+  parent_session_hash: null,
+  root_session_hash: "thread-row",
+  thread_kind: "root",
+  agent_nickname: null,
+  agent_role: null,
+  orphaned_subagent: false,
+  parent_link_conflict: false,
+  direct_subagent_count: 0,
+  descendant_subagent_count: 0,
+  own_total_tokens: 1_000,
+  subagent_total_tokens: 0,
+  combined_total_tokens: 1_000,
+  total_tokens: 1_000,
+  own_cost_usd: 0.01,
+  subagent_cost_usd: 0,
+  combined_cost_usd: 0.01,
+  cost_usd: 0.01,
+  ...overrides,
+});
+
 describe("SessionsPage", () => {
   beforeEach(() => {
     getSessions.mockReset();
@@ -154,6 +184,196 @@ describe("SessionsPage", () => {
     expect(screen.getByText("Fix authentication flow")).toBeInTheDocument();
     expect(screen.queryByText("Review release")).not.toBeInTheDocument();
     expect(screen.queryByText("Debug local proxy")).not.toBeInTheDocument();
+  });
+
+  it("folds direct and nested subagents under their root session", async () => {
+    const root = makeThreadSession({
+      session_hash: "root-hash",
+      session_id: "10000000-0000-4000-8000-000000000000",
+      root_session_hash: "root-hash",
+      title: "Root session",
+      direct_subagent_count: 1,
+      descendant_subagent_count: 2,
+      subagent_total_tokens: 500,
+      combined_total_tokens: 1_500,
+    });
+    const child = makeThreadSession({
+      session_hash: "child-hash",
+      session_id: "20000000-0000-4000-8000-000000000000",
+      parent_session_id: root.session_id,
+      parent_session_hash: root.session_hash,
+      root_session_hash: root.session_hash,
+      thread_kind: "subagent",
+      agent_nickname: "Direct child",
+      agent_role: "luna",
+      model: "gpt-5.6-luna",
+      own_total_tokens: 300,
+      total_tokens: 300,
+      combined_total_tokens: 300,
+    });
+    const grandchild = makeThreadSession({
+      session_hash: "grandchild-hash",
+      session_id: "30000000-0000-4000-8000-000000000000",
+      parent_session_id: child.session_id,
+      parent_session_hash: child.session_hash,
+      root_session_hash: root.session_hash,
+      thread_kind: "subagent",
+      agent_nickname: "Grandchild agent",
+      agent_role: "spark",
+      model: "gpt-5.3-codex-spark",
+      own_total_tokens: 200,
+      total_tokens: 200,
+      combined_total_tokens: 200,
+    });
+    getSessions.mockResolvedValue({
+      ...response,
+      session_count: 3,
+      returned_count: 3,
+      sessions: [root, child, grandchild],
+    });
+
+    render(<SessionsPage />);
+
+    expect(await screen.findByText("Root session")).toBeInTheDocument();
+    expect(screen.queryByText("Direct child")).not.toBeInTheDocument();
+    expect(screen.queryByText("Grandchild agent")).not.toBeInTheDocument();
+    expect(screen.getByText(/1 root sessions.*2 subagents collapsed/)).toBeInTheDocument();
+
+    const expand = screen.getByRole("button", { name: "Expand 2 subagents" });
+    expect(expand).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(expand);
+
+    expect(screen.getByRole("button", { name: "Collapse 2 subagents" })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("Subagent model usage")).toBeInTheDocument();
+    expect(screen.getByText("Direct child")).toBeInTheDocument();
+    expect(screen.getByText("Grandchild agent")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse 2 subagents" }));
+    expect(screen.queryByText("Direct child")).not.toBeInTheDocument();
+    expect(screen.queryByText("Grandchild agent")).not.toBeInTheDocument();
+  });
+
+  it("filters subagents by model within only the selected root", async () => {
+    const rootA = makeThreadSession({
+      session_hash: "root-a",
+      session_id: "40000000-0000-4000-8000-000000000000",
+      root_session_hash: "root-a",
+      title: "Root A",
+    });
+    const rootB = makeThreadSession({
+      session_hash: "root-b",
+      session_id: "50000000-0000-4000-8000-000000000000",
+      root_session_hash: "root-b",
+      title: "Root B",
+    });
+    const child = (overrides) => makeThreadSession({
+      thread_kind: "subagent",
+      title: null,
+      ...overrides,
+    });
+    getSessions.mockResolvedValue({
+      ...response,
+      session_count: 5,
+      returned_count: 5,
+      sessions: [
+        rootA,
+        child({
+          session_hash: "root-a-sol",
+          session_id: "60000000-0000-4000-8000-000000000000",
+          parent_session_id: rootA.session_id,
+          parent_session_hash: rootA.session_hash,
+          root_session_hash: rootA.session_hash,
+          agent_nickname: "A keep",
+          agent_role: "sol",
+          model: "gpt-5.6-sol",
+          own_total_tokens: 300,
+          total_tokens: 300,
+        }),
+        child({
+          session_hash: "root-a-luna",
+          session_id: "70000000-0000-4000-8000-000000000000",
+          parent_session_id: rootA.session_id,
+          parent_session_hash: rootA.session_hash,
+          root_session_hash: rootA.session_hash,
+          agent_nickname: "A hide",
+          agent_role: "luna",
+          model: "gpt-5.6-luna",
+          own_total_tokens: 200,
+          total_tokens: 200,
+        }),
+        rootB,
+        child({
+          session_hash: "root-b-spark",
+          session_id: "80000000-0000-4000-8000-000000000000",
+          parent_session_id: rootB.session_id,
+          parent_session_hash: rootB.session_hash,
+          root_session_hash: rootB.session_hash,
+          agent_nickname: "B child",
+          agent_role: "spark",
+          model: "gpt-5.3-codex-spark",
+          own_total_tokens: 100,
+          total_tokens: 100,
+        }),
+      ],
+    });
+
+    render(<SessionsPage />);
+    expect(await screen.findByText("Root A")).toBeInTheDocument();
+    expect(screen.getByText("Root B")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand 2 subagents" }));
+    fireEvent.click(screen.getByRole("button", { name: "Expand 1 subagents" }));
+    expect(screen.getByText("A keep")).toBeInTheDocument();
+    expect(screen.getByText("A hide")).toBeInTheDocument();
+    expect(screen.getByText("B child")).toBeInTheDocument();
+
+    const solFilter = screen.getByRole("button", { name: /gpt-5\.6-sol/ });
+    fireEvent.click(solFilter);
+    expect(solFilter).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText("A keep")).toBeInTheDocument();
+    expect(screen.queryByText("A hide")).not.toBeInTheDocument();
+    expect(screen.getByText("B child")).toBeInTheDocument();
+  });
+
+  it("keeps a matching child visible when its root is filtered out", async () => {
+    const root = makeThreadSession({
+      session_hash: "filtered-root",
+      session_id: "90000000-0000-4000-8000-000000000000",
+      root_session_hash: "filtered-root",
+      title: "Root hidden by search",
+    });
+    const child = makeThreadSession({
+      session_hash: "filtered-child",
+      session_id: "a0000000-0000-4000-8000-000000000000",
+      title: null,
+      parent_session_id: root.session_id,
+      parent_session_hash: root.session_hash,
+      root_session_hash: root.session_hash,
+      thread_kind: "subagent",
+      agent_nickname: "Visible child only",
+      agent_role: "luna",
+      model: "gpt-5.6-luna",
+    });
+    getSessions.mockResolvedValue({
+      ...response,
+      session_count: 2,
+      returned_count: 2,
+      sessions: [root, child],
+    });
+
+    render(<SessionsPage />);
+    expect(await screen.findByText("Root hidden by search")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search sessions" }), {
+      target: { value: "Visible child only" },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Visible child only")).toBeInTheDocument();
+      expect(screen.queryByText("Root hidden by search")).not.toBeInTheDocument();
+    });
+    expect(screen.getByText("1 of 2")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Expand .* subagents/ })).not.toBeInTheDocument();
   });
 
   it("filters the date range client-side without re-querying", async () => {

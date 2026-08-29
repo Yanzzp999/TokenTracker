@@ -10,8 +10,8 @@
  * bump last_seen_at.
  *
  * `shell` upgrade rule: hook-spawned sync processes report "cli" even on
- * machines running the macOS/Windows app (the shell marker env is only set
- * on the app-spawned serve process), so a non-"cli" shell never gets
+ * machines running the macOS/Windows/Linux app (the shell marker env is only
+ * set on app-spawned processes), so a non-"cli" shell never gets
  * overwritten by a later "cli" heartbeat the same day.
  */
 import { createClient } from "npm:@insforge/sdk";
@@ -25,7 +25,7 @@ const corsHeaders = {
 const MACHINE_HASH_RE = /^[0-9a-f]{64}$/;
 const APP_VERSION_RE = /^[0-9A-Za-z.+-]{1,32}$/;
 const PLATFORM_RE = /^[a-z0-9]{1,16}$/;
-const SHELLS = new Set(["cli", "macos", "windows"]);
+const SHELLS = new Set(["cli", "macos", "windows", "linux"]);
 
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {

@@ -258,7 +258,7 @@ flowchart LR
 | **Kein Content-Upload** | Nur Token-Zahlen und Zeitstempel. Nie Prompts, Responses oder Dateiinhalte. |
 | **Standardmäßig lokal** | Alle Daten bleiben auf deinem Rechner. Das Leaderboard ist vollständig optional. |
 | **Überprüfbar** | Open Source. Sieh selbst in [`src/lib/rollout.js`](src/lib/rollout.js) – nur Zahlen und Zeitstempel. |
-| **Nur anonyme Nutzungsstatistiken** | Nur zwei anonyme Übertragungen: (1) höchstens ein täglicher Heartbeat — ein Einweg-Hash der Maschinen-ID, App-Version, OS-Plattform und App-Shell (cli/mac/win); (2) anonyme Dashboard-Seiten-/Feature-Events (PostHog — Autocapture und Session-Recording deaktiviert, Browser-Do-Not-Track respektiert). Niemals Token-Zahlen, Modellnamen, Prompts oder Pfade. Auditierbar in [`src/lib/telemetry.js`](src/lib/telemetry.js) und [`dashboard/src/lib/analytics.js`](dashboard/src/lib/analytics.js); ein Schalter deaktiviert beides: `TOKENTRACKER_NO_TELEMETRY=1` (oder `DO_NOT_TRACK=1`). |
+| **Nur anonyme Nutzungsstatistiken** | Nur zwei anonyme Übertragungen: (1) höchstens ein täglicher Heartbeat — ein Einweg-Hash der Maschinen-ID, dazu App-Version, OS-Plattform und App-Shell (cli/macos/windows/linux) als separate Klartext-Felder; (2) anonyme Dashboard-Seiten-/Feature-Events (PostHog — Autocapture und Session-Recording deaktiviert, Browser-Do-Not-Track respektiert). Niemals Token-Zahlen, Modellnamen, Prompts oder Pfade. Auditierbar in [`src/lib/telemetry.js`](src/lib/telemetry.js) und [`dashboard/src/lib/analytics.js`](dashboard/src/lib/analytics.js); ein Schalter deaktiviert beides: `TOKENTRACKER_NO_TELEMETRY=1` (oder `DO_NOT_TRACK=1`). |
 
 ---
 

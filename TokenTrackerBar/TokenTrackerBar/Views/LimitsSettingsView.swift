@@ -28,6 +28,7 @@ struct LimitsSettingsView: View {
                 .toggleStyle(.switch)
                 .controlSize(.mini)
                 .labelsHidden()
+                .accessibilityLabel(Strings.limitDisplayModeRemaining)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
@@ -46,6 +47,7 @@ struct LimitsSettingsView: View {
                     .toggleStyle(.switch)
                     .controlSize(.mini)
                     .labelsHidden()
+                    .accessibilityLabel(Strings.toastOnResetLabel)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
@@ -59,6 +61,24 @@ struct LimitsSettingsView: View {
                     .toggleStyle(.switch)
                     .controlSize(.mini)
                     .labelsHidden()
+                    .accessibilityLabel(Strings.confettiOnResetLabel)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+
+            HStack(spacing: 10) {
+                Text(Strings.showSubscriptionsLabel)
+                    .font(.system(.body, design: .default))
+                    .foregroundStyle(.primary)
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { store.showSubscriptions },
+                    set: { store.setShowSubscriptionsFromMenu($0) }
+                ))
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .labelsHidden()
+                    .accessibilityLabel(Strings.showSubscriptionsLabel)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
@@ -108,6 +128,7 @@ struct LimitsSettingsView: View {
             .toggleStyle(.switch)
             .controlSize(.mini)
             .labelsHidden()
+            .accessibilityLabel(LimitsSettingsStore.displayNames[id] ?? id)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)

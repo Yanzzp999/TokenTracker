@@ -22,8 +22,10 @@ const {
 } = require("./codex-token-refresh");
 const {
   isCursorInstalled,
-  extractCursorSessionToken,
+  extractCursorAuth,
   fetchCursorUsageSummary,
+  fetchCursorSandAccessStatus,
+  fetchCursorSandUsageStatus,
 } = require("./cursor-config");
 const { fetchGrokLimits } = require("./grok-limits");
 const { fetchZcodeLimits } = require("./zcode-limits");
@@ -66,6 +68,13 @@ const CLAUDE_LIMITS_CACHE_FRESH_TTL_MS = 10 * 60 * 1000;
 // error, mirroring the Claude stale-fallback path.
 const CODEX_LIMITS_CACHE_FILE = "codex-usage-limits-cache.json";
 const CODEX_LIMITS_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+// OpenCode Go hits opencode.ai over the public internet (15s timeout) with no local CLI to
+// fall back on. A transient 5xx / timeout previously left the panel blank until the next
+// 2-minute poll — persist the last successful windows so a blip serves stale bars instead
+// of a flash of "fetch failed" (mirrors Claude / Codex / Antigravity).
+const OPENCODE_GO_LIMITS_CACHE_FILE = "opencode-go-usage-limits-cache.json";
+const OPENCODE_GO_LIMITS_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const OPENCODE_GO_LOCAL_ESTIMATE_CACHE_MAX_AGE_MS = 60 * 60 * 1000;
 // A 429 from the usage endpoint carries a long `retry-after` (often 20+ minutes). Persist
 // the cooldown so every surface — this process, the menu bar app's embedded server, a later
 // restart — stops calling until it expires. Hammering during the cooldown just renews the
@@ -671,20 +680,48 @@ function normalizeCursorUsageSummary(body) {
   };
 }
 
+function normalizeCursorSandUsageStatus(body, { eligible = true } = {}) {
+  if (!eligible || !body || body.includedLimitZero === true) return null;
+  const usedPercent = clampPercent(body.usagePercent);
+  const resetAt = typeof body.nextResetAt === "string" ? body.nextResetAt : null;
+  if (usedPercent === null || !resetAt || !Number.isFinite(Date.parse(resetAt))) return null;
+
+  const periodStart = typeof body.currentPeriodStart === "string" ? body.currentPeriodStart : null;
+  const periodStartMs = Date.parse(periodStart || "");
+  const resetAtMs = Date.parse(resetAt);
+  const windowSeconds = Number.isFinite(periodStartMs) && resetAtMs > periodStartMs
+    ? Math.round((resetAtMs - periodStartMs) / 1000)
+    : null;
+  return buildWindow({ usedPercent, resetAt, windowSeconds });
+}
+
 async function fetchCursorLimits({ home, fetchImpl = fetch } = {}) {
   if (!isCursorInstalled({ home })) {
     return { configured: false };
   }
-  const auth = extractCursorSessionToken({ home });
-  if (!auth?.cookie) {
+  const auth = extractCursorAuth({ home });
+  if (!auth?.cookie || !auth?.accessToken) {
     return { configured: false };
   }
   try {
-    const body = await fetchCursorUsageSummary({ cookie: auth.cookie, fetchImpl });
+    // The web summary and Grok Bot (internally "Sand") RPCs are independent.
+    // Fetch them concurrently so the fourth window does not add two network
+    // round-trips to every LIMITS refresh. Sand failures are intentionally
+    // isolated: older Cursor accounts/servers must keep their existing three
+    // monthly windows instead of turning the whole provider red.
+    const [body, sandAccessResult, sandUsageResult] = await Promise.all([
+      fetchCursorUsageSummary({ cookie: auth.cookie, fetchImpl }),
+      fetchCursorSandAccessStatus({ accessToken: auth.accessToken, fetchImpl }).catch(() => null),
+      fetchCursorSandUsageStatus({ accessToken: auth.accessToken, fetchImpl }).catch(() => null),
+    ]);
+    const grokBotWindow = normalizeCursorSandUsageStatus(sandUsageResult, {
+      eligible: sandAccessResult?.granted === true,
+    });
     return {
       configured: true,
       error: null,
       ...normalizeCursorUsageSummary(body),
+      quaternary_window: grokBotWindow,
     };
   } catch (error) {
     return {
@@ -1845,20 +1882,30 @@ function describeCopilotOtelStatus({ home, env = process.env } = {}) {
   const explicitPath = typeof env.COPILOT_OTEL_FILE_EXPORTER_PATH === "string"
     ? env.COPILOT_OTEL_FILE_EXPORTER_PATH
     : "";
-  const defaultDir = path.join(resolvedHome, ".copilot", "otel");
-  let hasFiles = false;
-  try {
-    if (fs.existsSync(defaultDir)) {
-      hasFiles = fs.readdirSync(defaultDir).some((entry) => entry.endsWith(".jsonl"));
-    }
-  } catch (_e) {}
-  if (!hasFiles && explicitPath && fs.existsSync(explicitPath)) hasFiles = true;
+  const defaultDirs = [
+    path.join(resolvedHome, ".copilot", "otel"),
+    path.join(resolvedHome, ".copilot-otel"),
+  ];
+  const detectedPaths = [];
+  for (const defaultDir of defaultDirs) {
+    try {
+      if (!fs.existsSync(defaultDir)) continue;
+      for (const entry of fs.readdirSync(defaultDir)) {
+        if (entry.endsWith(".jsonl")) {
+          detectedPaths.push(path.join(defaultDir, entry));
+        }
+      }
+    } catch (_e) {}
+  }
+  if (explicitPath && fs.existsSync(explicitPath)) detectedPaths.push(explicitPath);
   return {
     otel_enabled: enabled && (exporterType === "" || exporterType === "file"),
     otel_exporter_type: exporterType || null,
     otel_path: explicitPath || null,
-    otel_default_dir: defaultDir,
-    otel_has_files: hasFiles,
+    otel_default_dir: defaultDirs[0],
+    otel_default_dirs: defaultDirs,
+    otel_detected_paths: detectedPaths,
+    otel_has_files: detectedPaths.length > 0,
   };
 }
 
@@ -2387,6 +2434,82 @@ function writeCodexLimitsCache(limits, { home, nowMs = Date.now() } = {}) {
       spark_primary_window: limits.spark_primary_window || null,
       spark_secondary_window: limits.spark_secondary_window || null,
       reset_credits: limits.reset_credits || null,
+      cached_at: new Date(nowMs).toISOString(),
+    },
+  };
+  try {
+    fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+    const tmpPath = `${cachePath}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2), { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(tmpPath, cachePath);
+  } catch (_error) {}
+}
+
+function resolveOpencodeGoLimitsCachePath({ home } = {}) {
+  return path.join(home || os.homedir(), ".tokentracker", "tracker", OPENCODE_GO_LIMITS_CACHE_FILE);
+}
+
+function hasOpencodeGoWindow(limits) {
+  return Boolean(limits?.primary_window || limits?.secondary_window || limits?.tertiary_window);
+}
+
+function isOpencodeGoCacheWindowUsable(window, { nowMs } = {}) {
+  if (!window || typeof window !== "object") return false;
+  const resetAtMs = parseTimeMs(window.reset_at);
+  if (resetAtMs === null) return true;
+  return resetAtMs > nowMs;
+}
+
+function normalizeOpencodeGoCachedLimits(
+  raw,
+  { nowMs = Date.now(), maxAgeMs } = {},
+) {
+  const effectiveMaxAge = Number.isFinite(maxAgeMs)
+    ? maxAgeMs
+    : raw?.source === "local-estimate"
+      ? OPENCODE_GO_LOCAL_ESTIMATE_CACHE_MAX_AGE_MS
+      : OPENCODE_GO_LIMITS_CACHE_MAX_AGE_MS;
+  const cachedAtMs = parseTimeMs(raw?.cached_at);
+  if (!Number.isFinite(cachedAtMs)) return null;
+  if (cachedAtMs > nowMs + 60_000) return null;
+  if (nowMs - cachedAtMs > effectiveMaxAge) return null;
+
+  const cached = {
+    configured: true,
+    error: null,
+    source: typeof raw?.source === "string" ? raw.source : "api",
+    subscription_status: typeof raw?.subscription_status === "string" ? raw.subscription_status : null,
+    plan_label: typeof raw?.plan_label === "string" ? raw.plan_label : null,
+    primary_window: isOpencodeGoCacheWindowUsable(raw?.primary_window, { nowMs }) ? raw.primary_window : null,
+    secondary_window: isOpencodeGoCacheWindowUsable(raw?.secondary_window, { nowMs }) ? raw.secondary_window : null,
+    tertiary_window: isOpencodeGoCacheWindowUsable(raw?.tertiary_window, { nowMs }) ? raw.tertiary_window : null,
+    stale: true,
+    cached_at: raw.cached_at,
+  };
+  return hasOpencodeGoWindow(cached) ? cached : null;
+}
+
+function readOpencodeGoLimitsCache({ home, nowMs = Date.now() } = {}) {
+  const cachePath = resolveOpencodeGoLimitsCachePath({ home });
+  try {
+    const parsed = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+    return normalizeOpencodeGoCachedLimits(parsed?.opencodeGo, { nowMs });
+  } catch (_error) {
+    return null;
+  }
+}
+
+function writeOpencodeGoLimitsCache(limits, { home, nowMs = Date.now() } = {}) {
+  if (!limits?.configured || limits.error || !hasOpencodeGoWindow(limits)) return;
+  const cachePath = resolveOpencodeGoLimitsCachePath({ home });
+  const payload = {
+    opencodeGo: {
+      source: limits.source || "api",
+      subscription_status: limits.subscription_status || null,
+      plan_label: limits.plan_label || null,
+      primary_window: limits.primary_window || null,
+      secondary_window: limits.secondary_window || null,
+      tertiary_window: limits.tertiary_window || null,
       cached_at: new Date(nowMs).toISOString(),
     },
   };
@@ -3063,7 +3186,7 @@ async function fetchUsageLimitsUncached({
     : null;
 
   const providerFetch = withFetchTimeout(fetchImpl, providerTimeoutMs);
-  const [claudeResult, codexResult, cursor, kimi, gemini, kiro, antigravity, copilot, grok, zcode, opencodeGo, qoder, qoderCn, codingPlan, claudeServiceStatus] = await Promise.all([
+  const [claudeResult, codexResult, cursor, kimi, gemini, kiro, antigravity, copilot, grok, zcode, opencodeGoRaw, qoder, qoderCn, codingPlan, claudeServiceStatus] = await Promise.all([
     claudeToken && !freshClaudeCache && !claudeRetryAtMs
       ? withProviderTimeout(fetchClaudeUsageLimits(claudeToken, { fetchImpl: providerFetch, maxAttempts: 1 }), "Claude", providerTimeoutMs).then(
           (value) => ({ status: "fulfilled", value }),
@@ -3276,6 +3399,41 @@ async function fetchUsageLimitsUncached({
     }
   }
 
+  // OpenCode Go: persist last successful windows so a transient timeout/5xx
+  // (common on GFW-affected routes to opencode.ai) serves stale bars instead of
+  // a flashing "fetch failed". Mirrors Codex / Claude / Antigravity.
+  // Auth errors (401/403 invalid key, missing subscription, expired cookie) are
+  // actionable and must not be hidden behind stale cache — they carry
+  // `auth_error:true` from opencode-go-limits.js.
+  const opencodeGoIsAuthError =
+    Boolean(opencodeGoRaw?.auth_error) ||
+    (typeof opencodeGoRaw?.error === "string" &&
+      /Not signed in|auth cookie|Refresh the auth cookie|Failed to resolve Workspace ID.*401|Failed to resolve Workspace ID.*403/i.test(
+        opencodeGoRaw.error,
+      ));
+  let opencodeGo;
+  if (opencodeGoRaw && opencodeGoRaw.configured === false) {
+    opencodeGo = opencodeGoRaw;
+  } else if (opencodeGoIsAuthError) {
+    opencodeGo = opencodeGoRaw;
+  } else if (opencodeGoRaw?.subscription_status === "inactive") {
+    opencodeGo = opencodeGoRaw;
+  } else if (opencodeGoRaw && !opencodeGoRaw.error && hasOpencodeGoWindow(opencodeGoRaw)) {
+    opencodeGo = {
+      ...opencodeGoRaw,
+      stale: false,
+      cached_at: new Date(nowMs).toISOString(),
+    };
+    writeOpencodeGoLimitsCache(opencodeGo, { home, nowMs });
+  } else {
+    const cached = readOpencodeGoLimitsCache({ home, nowMs });
+    if (cached) {
+      opencodeGo = cached;
+    } else {
+      opencodeGo = opencodeGoRaw || { configured: true, error: "Unknown error" };
+    }
+  }
+
   const data = {
     fetched_at: new Date(nowMs).toISOString(),
     claude: withPlanLabel(claude, claudePlanType, "Claude"),
@@ -3336,6 +3494,7 @@ module.exports = {
   extractGeminiOauthClientCredentials,
   loadKimiCredentials,
   normalizeCursorUsageSummary,
+  normalizeCursorSandUsageStatus,
   normalizeGeminiQuotaResponse,
   normalizeKimiUsageResponse,
   parseKiroUsageOutput,

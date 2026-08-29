@@ -421,6 +421,25 @@ enum WidgetSnapshotWriter {
             }
         }
 
+        // OpenCode Go
+        if let opencodeGo = limits.opencodeGo, opencodeGo.configured {
+            if let w = opencodeGo.primaryWindow {
+                out.append(LimitProvider(source: "opencodeGo", label: "OpenCode Go",
+                                         fraction: w.usedPercent / 100.0,
+                                         resetsAt: parseISO(w.resetAt)))
+            }
+            if let w = opencodeGo.secondaryWindow {
+                out.append(LimitProvider(source: "opencodeGo", label: "OpenCode Go · Weekly",
+                                         fraction: w.usedPercent / 100.0,
+                                         resetsAt: parseISO(w.resetAt)))
+            }
+            if let w = opencodeGo.tertiaryWindow {
+                out.append(LimitProvider(source: "opencodeGo", label: "OpenCode Go · Monthly",
+                                         fraction: w.usedPercent / 100.0,
+                                         resetsAt: parseISO(w.resetAt)))
+            }
+        }
+
         // GitHub Copilot
         if let copilot = limits.copilot, copilot.configured {
             if let w = copilot.primaryWindow {

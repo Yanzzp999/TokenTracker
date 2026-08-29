@@ -528,7 +528,7 @@ struct DynamicIslandView: View {
             // view hug its content), scrollable beyond it — many configured
             // providers must not push the island past the panel's bottom.
             ScrollView(.vertical, showsIndicators: false) {
-                UsageLimitsView(limits: viewModel.usageLimits)
+                UsageLimitsView(limits: viewModel.usageLimits, subscriptions: viewModel.subscriptions)
             }
             .frame(maxHeight: DynamicIslandLayoutPolicy.limitsHeight(panelHeight: state.panelSize.height))
 

@@ -488,6 +488,7 @@ test("status trae-cn installed=false when the default path resolves but no stora
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-status-traecn-"));
   const prevHome = process.env.HOME;
   const prevUserProfile = process.env.USERPROFILE;
+  const prevAppData = process.env.APPDATA;
   const prevTraeCnHome = process.env.TOKENTRACKER_TRAE_CN_HOME;
   const prevTraeCnUsage = process.env.TOKENTRACKER_TRAE_CN_USAGE;
   const prevWrite = process.stdout.write;
@@ -495,6 +496,7 @@ test("status trae-cn installed=false when the default path resolves but no stora
   try {
     process.env.HOME = tmp;
     process.env.USERPROFILE = tmp;
+    process.env.APPDATA = path.join(tmp, "AppData", "Roaming");
     delete process.env.TOKENTRACKER_TRAE_CN_HOME;
     delete process.env.TOKENTRACKER_TRAE_CN_USAGE;
 
@@ -521,6 +523,8 @@ test("status trae-cn installed=false when the default path resolves but no stora
     else process.env.USERPROFILE = prevUserProfile;
     if (prevTraeCnHome === undefined) delete process.env.TOKENTRACKER_TRAE_CN_HOME;
     else process.env.TOKENTRACKER_TRAE_CN_HOME = prevTraeCnHome;
+    if (prevAppData === undefined) delete process.env.APPDATA;
+    else process.env.APPDATA = prevAppData;
     if (prevTraeCnUsage === undefined) delete process.env.TOKENTRACKER_TRAE_CN_USAGE;
     else process.env.TOKENTRACKER_TRAE_CN_USAGE = prevTraeCnUsage;
     await fs.rm(tmp, { recursive: true, force: true });

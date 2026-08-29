@@ -654,9 +654,9 @@ async function cmdStatus(argv = []) {
   // official API, so status surfaces the opt-in flag, the resolved storage
   // path, and whether the auth blob decrypts — the three inputs a "why is my
   // TRAE CN data missing" diagnosis needs.
-  // A resolvable default path does NOT mean the app is installed - the macOS
-  // resolver always derives one. Match the sync path semantics exactly:
-  // installed iff the storage file actually exists on disk.
+  // A resolvable default path does NOT mean the app is installed - the
+  // macOS/Windows resolver always derives one. Match the sync path semantics
+  // exactly: installed iff the storage file actually exists on disk.
   const traeCnStoragePath = resolveTraeCnStoragePath({ env: process.env, home });
   const traeCnInstalled = Boolean(
     traeCnStoragePath && fssync.existsSync(traeCnStoragePath),
@@ -1215,8 +1215,10 @@ function formatCopilotLines({ token, otel, sessionStore, appDb }) {
   const appDbState = appDb?.app_db_has_file
     ? `${appDb.app_db_mode || "set"} (${(appDb.app_db_paths || []).join(", ")})`
     : `not found (${appDb?.app_db_path || "unknown"})`;
+  const otelLocation =
+    otel.otel_path || otel.otel_detected_paths?.[0] || otel.otel_default_dir;
   const usageState = otel.otel_has_files
-    ? `set (${otel.otel_path || otel.otel_default_dir})`
+    ? `set (${otelLocation})`
     : otel.otel_enabled
       ? "enabled but no files yet"
       : "unset (OTEL export not enabled)";

@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * TRAE Work CN (国内版) config + usage fetch. Phase A: macOS + test-injected
+ * TRAE Work CN (国内版) config + usage fetch. Phase A: macOS + Windows + test-injected
  * paths only. Resolves the CN home, reads the `iCubeAuthInfo://icube.cloudide`
  * blob from User/globalStorage/storage.json (plaintext JSON or Base64 tc v5),
  * and talks to the TRAE CN usage API. JWTs / refresh tokens are never
@@ -85,7 +85,16 @@ function resolveTraeCnHome({ env = process.env, home = os.homedir(), platform = 
   if (platform === "darwin") {
     return path.join(home, "Library", "Application Support", TRAE_CN_APP_DIR);
   }
-  // ponytail: this phase is macOS + test-injected paths only.
+  if (platform === "win32") {
+    // Windows keeps the CN Work app under the roaming profile, mirroring the
+    // macOS Application Support layout (APPDATA/TRAE SOLO CN/User/...).
+    const appData =
+      typeof env.APPDATA === "string" && env.APPDATA.trim()
+        ? env.APPDATA.trim()
+        : path.join(home, "AppData", "Roaming");
+    return path.join(appData, TRAE_CN_APP_DIR);
+  }
+  // No verified CN Work app-data layout on other platforms yet.
   return null;
 }
 

@@ -257,7 +257,7 @@ flowchart LR
 | **コンテンツをアップロードしない** | トークン数とタイムスタンプのみ。プロンプト、レスポンス、ファイル内容は扱いません。 |
 | **デフォルトでローカル限定** | すべてのデータはマシン上に留まります。リーダーボードは完全にオプトインです。 |
 | **監査可能** | オープンソース。[`src/lib/rollout.js`](src/lib/rollout.js) を読んでください — 数字とタイムスタンプだけです。 |
-| **匿名利用統計のみ** | 外部送信は匿名の 2 種類だけ：(1) 1 日最大 1 回のハートビート——マシン ID の一方向ハッシュ、アプリバージョン、OS プラットフォーム、実行形態（cli/mac/win）；(2) 匿名のダッシュボードのページ/機能イベント（PostHog——autocapture とセッション録画は無効、ブラウザの Do-Not-Track を尊重）。トークン数、モデル名、プロンプト、パスは一切含まれません。[`src/lib/telemetry.js`](src/lib/telemetry.js) と [`dashboard/src/lib/analytics.js`](dashboard/src/lib/analytics.js) で監査可能。`TOKENTRACKER_NO_TELEMETRY=1` または `DO_NOT_TRACK=1` で両方を無効化できます。 |
+| **匿名利用統計のみ** | 外部送信は匿名の 2 種類だけ：(1) 1 日最大 1 回のハートビート——マシン ID の一方向ハッシュ、アプリバージョン、OS プラットフォーム、実行形態（cli/macos/windows/linux）；(2) 匿名のダッシュボードのページ/機能イベント（PostHog——autocapture とセッション録画は無効、ブラウザの Do-Not-Track を尊重）。トークン数、モデル名、プロンプト、パスは一切含まれません。[`src/lib/telemetry.js`](src/lib/telemetry.js) と [`dashboard/src/lib/analytics.js`](dashboard/src/lib/analytics.js) で監査可能。`TOKENTRACKER_NO_TELEMETRY=1` または `DO_NOT_TRACK=1` で両方を無効化できます。 |
 
 ---
 

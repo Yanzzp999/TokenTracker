@@ -94,6 +94,12 @@ extension UsageLimitsResponse {
             return guarded(zcode?.configured, zcode?.error, zcode?.primaryWindow?.usedPercent)
         case .zcodeGlm5Turbo:
             return guarded(zcode?.configured, zcode?.error, zcode?.secondaryWindow?.usedPercent)
+        case .opencodeGo5h:
+            return guarded(opencodeGo?.configured, opencodeGo?.error, opencodeGo?.primaryWindow?.usedPercent)
+        case .opencodeGoWeekly:
+            return guarded(opencodeGo?.configured, opencodeGo?.error, opencodeGo?.secondaryWindow?.usedPercent)
+        case .opencodeGoMonthly:
+            return guarded(opencodeGo?.configured, opencodeGo?.error, opencodeGo?.tertiaryWindow?.usedPercent)
         case .qoderQuota:
             return guarded(qoder?.configured, qoder?.error, qoder?.primaryWindow?.usedPercent)
         case .qoderUltimate:
@@ -330,6 +336,7 @@ struct CursorLimits: Codable, Equatable {
     let primaryWindow: GenericLimitWindow?
     let secondaryWindow: GenericLimitWindow?
     let tertiaryWindow: GenericLimitWindow?
+    let quaternaryWindow: GenericLimitWindow?
 
     enum CodingKeys: String, CodingKey {
         case configured, error
@@ -338,6 +345,7 @@ struct CursorLimits: Codable, Equatable {
         case primaryWindow = "primary_window"
         case secondaryWindow = "secondary_window"
         case tertiaryWindow = "tertiary_window"
+        case quaternaryWindow = "quaternary_window"
     }
 }
 

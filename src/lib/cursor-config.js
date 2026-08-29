@@ -76,6 +76,18 @@ function readCursorAccessTokenFromStateDb(stateDbPath, deps = {}) {
  *   - other WorkOS subjects:        "github|…", "oidc|…"      → kept verbatim
  */
 function extractCursorSessionToken({ home, platform, env, deps } = {}) {
+  const auth = extractCursorAuth({ home, platform, env, deps });
+  if (!auth) return null;
+  return { cookie: auth.cookie, userId: auth.userId };
+}
+
+/**
+ * Extract the Cursor web session and API bearer token from Cursor's own local
+ * login state. The raw access token is needed for Cursor's first-party Connect
+ * RPCs, while callers that only need the web cookie should continue using
+ * extractCursorSessionToken so the token is not propagated unnecessarily.
+ */
+function extractCursorAuth({ home, platform, env, deps } = {}) {
   const { stateDbPath, cliConfigPath } = resolveCursorPaths({ home, platform, env });
 
   // 1. Extract JWT from SQLite
@@ -95,7 +107,7 @@ function extractCursorSessionToken({ home, platform, env, deps } = {}) {
 
   // 3. Build cookie
   const cookie = `WorkosCursorSessionToken=${userId}%3A%3A${jwt}`;
-  return { cookie, userId };
+  return { cookie, userId, accessToken: jwt };
 }
 
 // WorkOS OAuth subject prefixes Cursor accepts as-is in the session cookie.
@@ -136,6 +148,10 @@ function extractUserIdFromJwt(jwt) {
 
 const CURSOR_CSV_URL = "https://cursor.com/api/dashboard/export-usage-events-csv?strategy=tokens";
 const CURSOR_SUMMARY_URL = "https://cursor.com/api/usage-summary";
+const CURSOR_RPC_ORIGIN = "https://api2.cursor.sh";
+const CURSOR_SAND_ACCESS_URL = `${CURSOR_RPC_ORIGIN}/aiserver.v1.DashboardService/GetSandAccessStatus`;
+const CURSOR_SAND_USAGE_URL = `${CURSOR_RPC_ORIGIN}/aiserver.v1.DashboardService/GetSandUsageStatus`;
+const CURSOR_RPC_MAX_RESPONSE_BYTES = 64 * 1024;
 const CURSOR_SOURCE_SCOPE = "account";
 
 function isCursorFetchTimeout(err) {
@@ -232,6 +248,166 @@ function fetchCursorUsageSummary({ cookie, timeoutMs = 30000, fetchImpl = fetch 
     }
     return res.json();
   });
+}
+
+function readProtoVarint(buffer, offset) {
+  let value = 0n;
+  let shift = 0n;
+  for (let i = offset; i < buffer.length && i < offset + 10; i += 1) {
+    const byte = buffer[i];
+    value |= BigInt(byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) return { value, offset: i + 1 };
+    shift += 7n;
+  }
+  throw new Error("Cursor API returned malformed protobuf");
+}
+
+function readProtoFields(input) {
+  const buffer = Buffer.isBuffer(input) ? input : Buffer.from(input);
+  const fields = [];
+  let offset = 0;
+  while (offset < buffer.length) {
+    const tag = readProtoVarint(buffer, offset);
+    offset = tag.offset;
+    const fieldNumber = Number(tag.value >> 3n);
+    const wireType = Number(tag.value & 0x07n);
+    if (!Number.isInteger(fieldNumber) || fieldNumber <= 0) {
+      throw new Error("Cursor API returned malformed protobuf");
+    }
+    if (wireType === 0) {
+      const decoded = readProtoVarint(buffer, offset);
+      fields.push({ fieldNumber, wireType, value: decoded.value });
+      offset = decoded.offset;
+    } else if (wireType === 1) {
+      if (offset + 8 > buffer.length) throw new Error("Cursor API returned malformed protobuf");
+      fields.push({ fieldNumber, wireType, value: buffer.subarray(offset, offset + 8) });
+      offset += 8;
+    } else if (wireType === 2) {
+      const decodedLength = readProtoVarint(buffer, offset);
+      offset = decodedLength.offset;
+      const length = Number(decodedLength.value);
+      if (!Number.isSafeInteger(length) || length < 0 || offset + length > buffer.length) {
+        throw new Error("Cursor API returned malformed protobuf");
+      }
+      fields.push({ fieldNumber, wireType, value: buffer.subarray(offset, offset + length) });
+      offset += length;
+    } else if (wireType === 5) {
+      if (offset + 4 > buffer.length) throw new Error("Cursor API returned malformed protobuf");
+      fields.push({ fieldNumber, wireType, value: buffer.subarray(offset, offset + 4) });
+      offset += 4;
+    } else {
+      throw new Error("Cursor API returned unsupported protobuf wire type");
+    }
+  }
+  return fields;
+}
+
+function protoTimestampToIso(input) {
+  let seconds = null;
+  let nanos = 0n;
+  for (const field of readProtoFields(input)) {
+    if (field.fieldNumber === 1 && field.wireType === 0) seconds = field.value;
+    if (field.fieldNumber === 2 && field.wireType === 0) nanos = field.value;
+  }
+  if (seconds === null || nanos < 0n || nanos > 999_999_999n) return null;
+  const milliseconds = Number(seconds) * 1000 + Number(nanos) / 1_000_000;
+  if (!Number.isFinite(milliseconds)) return null;
+  try {
+    return new Date(milliseconds).toISOString();
+  } catch {
+    return null;
+  }
+}
+
+function decodeCursorSandAccessStatus(input) {
+  let state = 0;
+  let blockReason = 0;
+  for (const field of readProtoFields(input)) {
+    if (field.fieldNumber === 1 && field.wireType === 0) state = Number(field.value);
+    if (field.fieldNumber === 3 && field.wireType === 0) blockReason = Number(field.value);
+  }
+  return { state, blockReason, granted: state === 1 };
+}
+
+function decodeCursorSandUsageStatus(input) {
+  const result = {
+    currentPeriodStart: null,
+    nextResetAt: null,
+    usagePercent: null,
+    includedLimitZero: false,
+    availableBankedResetCount: 0,
+    usesPooledEnterpriseAllowance: false,
+    hasAvailableUsage: false,
+    hasNonZeroIncludedLimit: false,
+  };
+  for (const field of readProtoFields(input)) {
+    if (field.fieldNumber === 1 && field.wireType === 2) {
+      result.currentPeriodStart = protoTimestampToIso(field.value);
+    } else if (field.fieldNumber === 2 && field.wireType === 2) {
+      result.nextResetAt = protoTimestampToIso(field.value);
+    } else if (field.fieldNumber === 3 && field.wireType === 1) {
+      result.usagePercent = field.value.readDoubleLE(0);
+    } else if (field.fieldNumber === 4 && field.wireType === 0) {
+      result.includedLimitZero = field.value !== 0n;
+    } else if (field.fieldNumber === 5 && field.wireType === 0) {
+      result.availableBankedResetCount = Number(field.value);
+    } else if (field.fieldNumber === 6 && field.wireType === 0) {
+      result.usesPooledEnterpriseAllowance = field.value !== 0n;
+    } else if (field.fieldNumber === 7 && field.wireType === 0) {
+      result.hasAvailableUsage = field.value !== 0n;
+    } else if (field.fieldNumber === 8 && field.wireType === 0) {
+      result.hasNonZeroIncludedLimit = field.value !== 0n;
+    }
+  }
+  if (!Number.isFinite(result.usagePercent)) result.usagePercent = null;
+  return result;
+}
+
+async function fetchCursorProtoRpc({ url, accessToken, timeoutMs = 15000, fetchImpl = fetch }) {
+  const res = await fetchImpl(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/proto",
+      "Connect-Protocol-Version": "1",
+    },
+    body: Buffer.alloc(0),
+    redirect: "error",
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (res.status === 401 || res.status === 403) {
+    throw new Error("Cursor session expired — re-login in Cursor to refresh");
+  }
+  if (res.status !== 200) throw new Error(`Cursor API returned ${res.status}`);
+  const contentType = String(res.headers?.get?.("content-type") || "").toLowerCase();
+  if (!contentType.startsWith("application/proto")) {
+    throw new Error("Cursor API returned an unexpected response type");
+  }
+  const body = Buffer.from(await res.arrayBuffer());
+  if (body.length > CURSOR_RPC_MAX_RESPONSE_BYTES) {
+    throw new Error("Cursor API returned an oversized response");
+  }
+  return body;
+}
+
+async function fetchCursorSandAccessStatus({ accessToken, timeoutMs, fetchImpl = fetch }) {
+  const body = await fetchCursorProtoRpc({
+    url: CURSOR_SAND_ACCESS_URL,
+    accessToken,
+    timeoutMs,
+    fetchImpl,
+  });
+  return decodeCursorSandAccessStatus(body);
+}
+
+async function fetchCursorSandUsageStatus({ accessToken, timeoutMs, fetchImpl = fetch }) {
+  const body = await fetchCursorProtoRpc({
+    url: CURSOR_SAND_USAGE_URL,
+    accessToken,
+    timeoutMs,
+    fetchImpl,
+  });
+  return decodeCursorSandUsageStatus(body);
 }
 
 function fetchUrlRaw({ urlStr, cookie, timeoutMs = 30000, fetchImpl = fetch }) {
@@ -414,9 +590,14 @@ module.exports = {
   resolveCursorPaths,
   isCursorInstalled,
   readCursorAccessTokenFromStateDb,
+  extractCursorAuth,
   extractCursorSessionToken,
   fetchCursorUsageCsv,
   fetchCursorUsageSummary,
+  decodeCursorSandAccessStatus,
+  decodeCursorSandUsageStatus,
+  fetchCursorSandAccessStatus,
+  fetchCursorSandUsageStatus,
   parseCursorCsv,
   isCursorBillableKind,
   normalizeCursorUsage,

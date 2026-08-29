@@ -5,6 +5,7 @@ import { isLikelyExpiredAccessToken } from "../lib/auth-token";
 import { getPublicVisibility } from "../lib/api";
 import { clearLocalApiAuthToken, getLocalApiAuthHeaders } from "../lib/local-api-auth";
 import { isNativeWindowsApp } from "../lib/native-bridge.js";
+import { restoreInsforgeUser } from "../lib/insforge-session-recovery.mjs";
 
 const InsforgeAuthContext = createContext(null);
 
@@ -85,16 +86,8 @@ export function InsforgeAuthProvider({ children }) {
     setLoading(true);
     (async () => {
       try {
-        let { data, error } = await client.auth.getCurrentUser();
+        const { data, error } = await restoreInsforgeUser(client.auth, { isActive: () => active });
         if (!active) return;
-        // OAuth 回调与首次 getCurrentUser 偶发竞态：无 error 但 user 仍为空时再试一次
-        if (!error && !data?.user) {
-          await new Promise((r) => setTimeout(r, 150));
-          if (!active) return;
-          const again = await client.auth.getCurrentUser();
-          data = again.data;
-          error = again.error;
-        }
         if (error) {
           setUser(null);
           return;

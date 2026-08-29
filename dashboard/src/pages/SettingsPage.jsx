@@ -1,6 +1,6 @@
 import React from "react";
-import { FlaskConical, Gauge, Globe, Monitor, Palette, UserRound } from "lucide-react";
-import { useSearchParams } from "react-router-dom";
+import { FlaskConical, Gauge, Globe, Monitor, Palette, Settings, UserRound } from "lucide-react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { LimitsSettingsPanel } from "../components/LimitsSettingsPanel.jsx";
 import { AccountSection } from "../components/settings/AccountSection.jsx";
 import { AppearanceSection } from "../components/settings/AppearanceSection.jsx";
@@ -53,6 +53,7 @@ export function SettingsPage() {
   const toastOnReset = nativeSettings?.toastOnReset !== false;
   const confettiOnReset = nativeSettings?.confettiOnReset !== false;
   const [searchParams, setSearchParams] = useSearchParams();
+  const navigate = useNavigate();
   const requestedSection = searchParams.get("section");
   const requestedSectionAvailable =
     Object.values(SETTINGS_SECTION_IDS).includes(requestedSection) &&
@@ -134,6 +135,28 @@ export function SettingsPage() {
                   onChange={() => setNativeSetting("confettiOnReset", !confettiOnReset)}
                   ariaLabel={copy("settings.menubar.confettiOnReset")}
                 />
+              }
+            />
+            <SettingsRow
+              label={copy("settings.limits.showSubscriptions")}
+              hint={copy("settings.limits.showSubscriptionsHint")}
+              control={
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => navigate("/limits?openSubscriptions=1")}
+                    aria-label={copy("limits.page.openSubscriptions")}
+                    title={copy("limits.page.openSubscriptions")}
+                    className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-oai-gray-200 dark:border-oai-gray-700 bg-white dark:bg-oai-gray-900 text-oai-gray-500 dark:text-oai-gray-400 hover:bg-oai-gray-100 dark:hover:bg-oai-gray-800 hover:text-oai-black dark:hover:text-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-oai-brand-500"
+                  >
+                    <Settings size={14} aria-hidden />
+                  </button>
+                  <ToggleSwitch
+                    checked={limitsPrefs.showSubscriptions !== false}
+                    onChange={() => limitsPrefs.setShowSubscriptions(!limitsPrefs.showSubscriptions)}
+                    ariaLabel={copy("settings.limits.showSubscriptions")}
+                  />
+                </div>
               }
             />
           </SectionCard>

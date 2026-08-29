@@ -120,6 +120,7 @@
   "limits.panel.title": "사용 한도",
   "limits.panel.mode_separator": " · ",
   "limits.label.cursor_plan": "플랜",
+  "limits.label.cursor_grok_bot": "Grok 봇",
   "limits.label.cursor_auto": "자동",
   "limits.label.cursor_api": "API",
   "limits.label.kiro_month": "월간",
@@ -525,6 +526,14 @@
   "sessions.grok.token_breakdown": "입력 {{input}} · 캐시 읽기 {{cacheRead}} · 캐시 쓰기 {{cacheWrite}} · 출력 {{output}} · 추론 {{reasoning}}",
   "sessions.grok.runtime_breakdown": "모델 호출 {{calls}}회 · API {{seconds}}초 · 도구 {{tools}}회 · 오류 {{errors}}개",
   "sessions.grok.context_breakdown": "컨텍스트 {{used}} / {{window}} ({{percent}}%)",
+  "sessions.badge.subagent": "하위 에이전트",
+  "sessions.thread.expand": "하위 에이전트 {{count}}개 펼치기",
+  "sessions.thread.collapse": "하위 에이전트 {{count}}개 접기",
+  "sessions.thread.tokens_summary": "자체 {{own}} · 하위 에이전트 {{subagents}} · 합계 {{combined}}",
+  "sessions.thread.result_count": "루트 세션 {{roots}}개 · 하위 에이전트 {{subagents}}개 접힘",
+  "sessions.thread.model_usage": "하위 에이전트 모델 사용량",
+  "sessions.thread.model_all": "전체 · {{count}}개 · {{tokens}}",
+  "sessions.thread.model_item": "{{model}} · {{count}}개 · {{tokens}}",
   "sessions.duration.minutes": "{{minutes}}분",
   "sessions.duration.hours": "{{hours}}시간 {{minutes}}분",
   "sessions.project.unknown": "제목 없는 세션",
@@ -555,5 +564,7 @@
   "limits.alert.title": "{{provider}} 한도가 일찍 소진될 수 있습니다",
   "limits.alert.body": "현재 속도라면 {{eta}} 후 소진될 수 있습니다({{percent}}% 사용됨).",
   "settings.section.labs": "Labs",
-  "limits.alert.blocked": "알림이 꺼져 있음 — 시스템 설정에서 허용하세요"
+  "limits.alert.blocked": "알림이 꺼져 있음 — 시스템 설정에서 허용하세요",
+  "settings.limits.showSubscriptions": "구독을 한도에 표시",
+  "settings.limits.showSubscriptionsHint": "수동으로 등록한 구독 갱신 바를 한도와 함께 표시합니다."
 }

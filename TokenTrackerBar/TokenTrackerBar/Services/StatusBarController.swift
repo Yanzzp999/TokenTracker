@@ -526,6 +526,12 @@ final class StatusBarController: NSObject {
                 return genericLimitValue(id: id, metric: metric, configured: viewModel.usageLimits?.zcode?.configured, error: viewModel.usageLimits?.zcode?.error, window: viewModel.usageLimits?.zcode?.primaryWindow)
             case .zcodeGlm5Turbo:
                 return genericLimitValue(id: id, metric: metric, configured: viewModel.usageLimits?.zcode?.configured, error: viewModel.usageLimits?.zcode?.error, window: viewModel.usageLimits?.zcode?.secondaryWindow)
+            case .opencodeGo5h:
+                return genericLimitValue(id: id, metric: metric, configured: viewModel.usageLimits?.opencodeGo?.configured, error: viewModel.usageLimits?.opencodeGo?.error, window: viewModel.usageLimits?.opencodeGo?.primaryWindow)
+            case .opencodeGoWeekly:
+                return genericLimitValue(id: id, metric: metric, configured: viewModel.usageLimits?.opencodeGo?.configured, error: viewModel.usageLimits?.opencodeGo?.error, window: viewModel.usageLimits?.opencodeGo?.secondaryWindow)
+            case .opencodeGoMonthly:
+                return genericLimitValue(id: id, metric: metric, configured: viewModel.usageLimits?.opencodeGo?.configured, error: viewModel.usageLimits?.opencodeGo?.error, window: viewModel.usageLimits?.opencodeGo?.tertiaryWindow)
             case .qoderQuota:
                 return genericLimitValue(id: id, metric: metric, configured: viewModel.usageLimits?.qoder?.configured, error: viewModel.usageLimits?.qoder?.error, window: viewModel.usageLimits?.qoder?.primaryWindow)
             case .qoderUltimate:
@@ -1291,6 +1297,7 @@ final class StatusBarController: NSObject {
     // MARK: - Menu Actions
 
     @objc private func openPopover() {
+        popoverReshowAttempted = false
         // Small delay to let the menu dismiss before showing popover
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             self?.togglePopover()

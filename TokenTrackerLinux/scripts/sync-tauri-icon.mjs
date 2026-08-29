@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { PNG } from 'pngjs';
 
@@ -33,7 +34,16 @@ export function syncTauriIcon(sourcePath = canonicalIconPath, destinationPath = 
   }
 
   if (!current?.equals(rgbaPng)) {
-    fs.writeFileSync(destinationPath, rgbaPng);
+    const temporaryPath = path.join(
+      path.dirname(destinationPath),
+      `.${path.basename(destinationPath)}.${process.pid}.${randomUUID()}.tmp`,
+    );
+    try {
+      fs.writeFileSync(temporaryPath, rgbaPng, { flag: 'wx' });
+      fs.renameSync(temporaryPath, destinationPath);
+    } finally {
+      fs.rmSync(temporaryPath, { force: true });
+    }
   }
 
   return destinationPath;

@@ -28,6 +28,7 @@ export { LIMIT_PROVIDER_ICON_KEYS, limitProviderIconKey, limitProviderName };
 const ORDER_KEY = "tt.limits.providerOrder";
 const VISIBILITY_KEY = "tt.limits.providerVisibility";
 const DISPLAY_MODE_KEY = "tt.limits.displayMode";
+const SHOW_SUBSCRIPTIONS_KEY = "tt.limits.showSubscriptions";
 const UPDATED_AT_KEY = "tt.limits.updatedAt";
 const NATIVE_PREFERENCES_KEY = "limitsPreferences";
 const NATIVE_DISPLAY_MODE_KEY = "limitsDisplayMode";
@@ -42,6 +43,7 @@ const STORAGE_KEYS = new Set([
   ORDER_KEY,
   VISIBILITY_KEY,
   DISPLAY_MODE_KEY,
+  SHOW_SUBSCRIPTIONS_KEY,
   UPDATED_AT_KEY,
 ]);
 
@@ -83,6 +85,10 @@ function normalizeDisplayMode(value) {
   return VALID_DISPLAY_MODES.has(value) ? value : LIMIT_DISPLAY_MODES.USED;
 }
 
+function normalizeShowSubscriptions(value) {
+  return typeof value === "boolean" ? value : true;
+}
+
 function normalizeUpdatedAt(value) {
   if (value === null || value === undefined) return undefined;
   if (typeof value === "number") {
@@ -103,6 +109,7 @@ function normalizeSnapshot(value = {}) {
     displayMode: normalizeDisplayMode(source.displayMode),
     providerOrder: normalizeOrder(source.providerOrder),
     providerVisibility: normalizeVisibility(source.providerVisibility),
+    showSubscriptions: normalizeShowSubscriptions(source.showSubscriptions),
     updatedAt: normalizeUpdatedAt(source.updatedAt),
   };
 }
@@ -137,6 +144,17 @@ function readDisplayMode() {
   }
 }
 
+function readShowSubscriptions() {
+  if (typeof window === "undefined") return true;
+  try {
+    const raw = window.localStorage.getItem(SHOW_SUBSCRIPTIONS_KEY);
+    if (raw === null) return true;
+    return normalizeShowSubscriptions(JSON.parse(raw));
+  } catch {
+    return true;
+  }
+}
+
 function readUpdatedAt() {
   if (typeof window === "undefined") return undefined;
   try {
@@ -163,6 +181,7 @@ function readLocalSnapshot() {
     displayMode: readDisplayMode(),
     providerOrder: readOrder(),
     providerVisibility: readVisibility(),
+    showSubscriptions: readShowSubscriptions(),
     updatedAt: readUpdatedAt(),
   });
 }
@@ -180,6 +199,10 @@ function writeLocalSnapshot(snapshot) {
       JSON.stringify(normalized.providerVisibility),
     );
     window.localStorage.setItem(DISPLAY_MODE_KEY, normalized.displayMode);
+    window.localStorage.setItem(
+      SHOW_SUBSCRIPTIONS_KEY,
+      JSON.stringify(normalized.showSubscriptions),
+    );
     if (normalized.updatedAt === undefined) {
       window.localStorage.removeItem(UPDATED_AT_KEY);
     } else {
@@ -196,6 +219,7 @@ function toBridgeSnapshot(snapshot) {
     displayMode: normalized.displayMode,
     providerOrder: [...normalized.providerOrder],
     providerVisibility: { ...normalized.providerVisibility },
+    showSubscriptions: normalized.showSubscriptions,
     updatedAt: normalized.updatedAt ?? null,
   };
 }
@@ -226,7 +250,8 @@ function samePreferences(a, b) {
   return (
     a.displayMode === b.displayMode &&
     sameOrder(a.providerOrder, b.providerOrder) &&
-    sameVisibility(a.providerVisibility, b.providerVisibility)
+    sameVisibility(a.providerVisibility, b.providerVisibility) &&
+    a.showSubscriptions === b.showSubscriptions
   );
 }
 
@@ -285,6 +310,10 @@ export function useLimitsDisplayPrefs() {
   const setDisplayMode = useCallback((mode) => {
     if (!VALID_DISPLAY_MODES.has(mode)) return;
     commitUserChange((current) => ({ ...current, displayMode: mode }));
+  }, [commitUserChange]);
+
+  const setShowSubscriptions = useCallback((value) => {
+    commitUserChange((current) => ({ ...current, showSubscriptions: Boolean(value) }));
   }, [commitUserChange]);
 
   const applyLegacyDisplayMode = useCallback((mode) => {
@@ -401,6 +430,7 @@ export function useLimitsDisplayPrefs() {
       displayMode: LIMIT_DISPLAY_MODES.USED,
       providerOrder: defaultOrder(),
       providerVisibility: defaultVisibility(),
+      showSubscriptions: true,
     }));
   }, [commitUserChange]);
 
@@ -417,7 +447,9 @@ export function useLimitsDisplayPrefs() {
     order: prefs.providerOrder,
     visibility: prefs.providerVisibility,
     displayMode: prefs.displayMode,
+    showSubscriptions: prefs.showSubscriptions,
     setDisplayMode,
+    setShowSubscriptions,
     visibleOrdered,
     toggle,
     moveUp,

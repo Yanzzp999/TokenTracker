@@ -16,8 +16,44 @@ EMBED_DIR="${TOKENTRACKER_LINUX_EMBED_DIR:-$LINUX_DIR/EmbeddedServer}"
 DASHBOARD_DIST="${TOKENTRACKER_DASHBOARD_DIST:-$REPO_ROOT/dashboard/dist}"
 TAURI_ICON="${TOKENTRACKER_TAURI_ICON:-$LINUX_DIR/src-tauri/icons/icon.png}"
 
-node "$LINUX_DIR/scripts/sync-tauri-icon.mjs" "$REPO_ROOT/dashboard/public/icon-512.png" "$TAURI_ICON"
 TARGET_ARCH="${TARGET_ARCH:-x64}"
+if [[ "$TARGET_ARCH" != "x64" ]]; then
+  echo "Refusing to bundle unsupported Linux architecture: $TARGET_ARCH" >&2
+  exit 1
+fi
+
+assert_safe_embed_dir() {
+  local normalized="$EMBED_DIR"
+  while [[ "$normalized" != "/" && "$normalized" == */ ]]; do
+    normalized="${normalized%/}"
+  done
+  if [[ -z "$normalized" || "$normalized" != /* ]]; then
+    echo "Refusing to clean a non-absolute EmbeddedServer path: $EMBED_DIR" >&2
+    exit 1
+  fi
+  case "$normalized" in
+    /|"$SCRIPT_DIR"|"$LINUX_DIR"|"$REPO_ROOT")
+      echo "Refusing to clean unsafe EmbeddedServer path: $EMBED_DIR" >&2
+      exit 1
+      ;;
+  esac
+  if [[ "$(basename -- "$normalized")" != "EmbeddedServer" ]]; then
+    echo "Refusing to clean a path not named EmbeddedServer: $EMBED_DIR" >&2
+    exit 1
+  fi
+
+  local component="$normalized"
+  while [[ "$component" != "/" ]]; do
+    if [[ -L "$component" ]]; then
+      echo "Refusing to clean an EmbeddedServer path containing a symlink: $EMBED_DIR" >&2
+      exit 1
+    fi
+    component="$(dirname -- "$component")"
+  done
+}
+
+assert_safe_embed_dir
+
 NODE_PLATFORM="linux-${TARGET_ARCH}"
 NODE_TAR="node-v${NODE_VERSION}-${NODE_PLATFORM}.tar.gz"
 NODE_BASE_URL="https://nodejs.org/dist/v${NODE_VERSION}"
@@ -27,6 +63,8 @@ if [[ "${1:-}" == "--clean" ]]; then
   echo "Cleaned $EMBED_DIR"
   exit 0
 fi
+
+node "$LINUX_DIR/scripts/sync-tauri-icon.mjs" "$REPO_ROOT/dashboard/public/icon-512.png" "$TAURI_ICON"
 
 rm -rf "$EMBED_DIR"
 mkdir -p "$EMBED_DIR"

@@ -1546,7 +1546,7 @@ struct ClawdCompanionView: View {
         }
 
         generic("cursor", configured: limits.cursor.configured, error: limits.cursor.error, windows: [
-            (Strings.cursorPlanLabel, limits.cursor.primaryWindow), (Strings.cursorAutoLabel, limits.cursor.secondaryWindow), ("API", limits.cursor.tertiaryWindow)
+            (Strings.cursorPlanLabel, limits.cursor.primaryWindow), (Strings.cursorAutoLabel, limits.cursor.secondaryWindow), ("API", limits.cursor.tertiaryWindow), (Strings.cursorGrokBotLabel, limits.cursor.quaternaryWindow)
         ])
         generic("gemini", configured: limits.gemini.configured, error: limits.gemini.error, windows: [
             ("Pro", limits.gemini.primaryWindow), ("Flash", limits.gemini.secondaryWindow), ("Lite", limits.gemini.tertiaryWindow)

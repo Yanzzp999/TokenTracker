@@ -66,7 +66,7 @@ vi.mock("./hooks/use-cloud-usage-sync", () => ({
   useCloudUsageSync: vi.fn(),
 }));
 
-vi.mock("./lib/mock-data", () => ({
+vi.mock("./lib/mock-mode", () => ({
   isMockEnabled: () => false,
 }));
 

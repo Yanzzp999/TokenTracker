@@ -120,6 +120,7 @@
   "limits.panel.title": "使用制限",
   "limits.panel.mode_separator": " · ",
   "limits.label.cursor_plan": "プラン",
+  "limits.label.cursor_grok_bot": "Grokボット",
   "limits.label.cursor_auto": "自動",
   "limits.label.cursor_api": "API",
   "limits.label.kiro_month": "月間",
@@ -525,6 +526,14 @@
   "sessions.grok.token_breakdown": "入力 {{input}} · キャッシュ読取 {{cacheRead}} · キャッシュ書込 {{cacheWrite}} · 出力 {{output}} · 推論 {{reasoning}}",
   "sessions.grok.runtime_breakdown": "モデル呼出 {{calls}} 回 · API {{seconds}} 秒 · ツール {{tools}} 回 · エラー {{errors}} 件",
   "sessions.grok.context_breakdown": "コンテキスト {{used}} / {{window}}（{{percent}}%）",
+  "sessions.badge.subagent": "サブエージェント",
+  "sessions.thread.expand": "{{count}} 件のサブエージェントを展開",
+  "sessions.thread.collapse": "{{count}} 件のサブエージェントを折りたたむ",
+  "sessions.thread.tokens_summary": "自身 {{own}} · サブエージェント {{subagents}} · 合計 {{combined}}",
+  "sessions.thread.result_count": "ルートセッション {{roots}} 件 · サブエージェント {{subagents}} 件を折りたたみ",
+  "sessions.thread.model_usage": "サブエージェントのモデル使用量",
+  "sessions.thread.model_all": "すべて · {{count}} 件 · {{tokens}}",
+  "sessions.thread.model_item": "{{model}} · {{count}} 件 · {{tokens}}",
   "sessions.duration.minutes": "{{minutes}}分",
   "sessions.duration.hours": "{{hours}}時間 {{minutes}}分",
   "sessions.project.unknown": "無題のセッション",
@@ -555,5 +564,7 @@
   "limits.alert.title": "{{provider}} の上限が早く尽きる可能性があります",
   "limits.alert.body": "現在のペースでは、残り {{eta}} で使い切る可能性があります（{{percent}}% 使用済み）。",
   "settings.section.labs": "Labs",
-  "limits.alert.blocked": "通知がオフです — システム設定で許可してください"
+  "limits.alert.blocked": "通知がオフです — システム設定で許可してください",
+  "settings.limits.showSubscriptions": "サブスクを制限表示に表示",
+  "settings.limits.showSubscriptionsHint": "手動登録した更新日バーを制限と一緒に表示します。"
 }

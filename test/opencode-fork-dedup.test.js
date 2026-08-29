@@ -359,15 +359,38 @@ test("parseOpencodeDbIncremental keeps the authoritative value of an in-place me
       source: "opencode",
       cursorKey: "opencode",
     });
-    const totals = await queueTotals(queuePath);
+    let totals = await queueTotals(queuePath);
     assert.equal(totals.output_tokens, 8);
     assert.equal(totals.input_tokens, 100);
+    assert.equal(Object.values(cursors.hourly.buckets)[0].totals.conversation_count, 1);
 
-    // A fork taken AFTER finalization still dedupes against the final value.
+    // A later authoritative correction can lower one column while raising
+    // another. Replace the prior snapshot; do not add a second conversation.
+    await parseOpencodeDbIncremental({
+      dbMessages: [msg({
+        id: "msg_1",
+        sessionID: "ses_1",
+        created: base + 1000,
+        input: 100,
+        output: 5,
+        cached: 3,
+      })],
+      cursors,
+      queuePath,
+      source: "opencode",
+      cursorKey: "opencode",
+    });
+    totals = await queueTotals(queuePath);
+    assert.equal(totals.output_tokens, 5);
+    assert.equal(totals.cached_input_tokens, 3);
+    assert.equal(totals.input_tokens, 100);
+    assert.equal(Object.values(cursors.hourly.buckets)[0].totals.conversation_count, 1);
+
+    // A fork taken AFTER correction still dedupes against the final value.
     const res = await parseOpencodeDbIncremental({
       dbMessages: [
-        msg({ id: "msg_1", sessionID: "ses_1", created: base + 1000, input: 100, output: 8 }),
-        msg({ id: "msg_f", sessionID: "ses_fork", created: base + 1000, input: 100, output: 8 }),
+        msg({ id: "msg_1", sessionID: "ses_1", created: base + 1000, input: 100, output: 5, cached: 3 }),
+        msg({ id: "msg_f", sessionID: "ses_fork", created: base + 1000, input: 100, output: 5, cached: 3 }),
       ],
       cursors,
       queuePath,
@@ -376,6 +399,50 @@ test("parseOpencodeDbIncremental keeps the authoritative value of an in-place me
     });
     assert.equal(res.eventsAggregated, 0);
     assert.deepEqual(await queueTotals(queuePath), totals);
+  });
+});
+
+test("parseOpencodeDbIncremental moves an updated message between model/time buckets", async () => {
+  await withTmp(async (tmp) => {
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const cursors = newCursors();
+    const base = Date.parse(HOUR);
+
+    await parseOpencodeDbIncremental({
+      dbMessages: [msg({
+        id: "msg_move",
+        sessionID: "ses_move",
+        created: base + 1000,
+        completed: base + 1000,
+        input: 50,
+        output: 10,
+        modelID: "model-a",
+      })],
+      cursors,
+      queuePath,
+      source: "opencode",
+    });
+    await parseOpencodeDbIncremental({
+      dbMessages: [msg({
+        id: "msg_move",
+        sessionID: "ses_move",
+        created: base + 1000,
+        completed: base + 31 * 60 * 1000,
+        input: 50,
+        output: 10,
+        modelID: "model-b",
+      })],
+      cursors,
+      queuePath,
+      source: "opencode",
+    });
+
+    const totals = await queueTotals(queuePath);
+    assert.equal(totals.input_tokens, 50);
+    assert.equal(totals.output_tokens, 10);
+    const buckets = Object.values(cursors.hourly.buckets);
+    assert.equal(buckets.filter((bucket) => bucket.totals.conversation_count === 1).length, 1);
+    assert.equal(buckets.reduce((sum, bucket) => sum + bucket.totals.conversation_count, 0), 1);
   });
 });
 

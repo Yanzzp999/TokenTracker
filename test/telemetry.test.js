@@ -62,6 +62,7 @@ test("resolveShell only accepts known shells and defaults to cli", () => {
   assert.equal(resolveShell({}), "cli");
   assert.equal(resolveShell({ TOKENTRACKER_APP_SHELL: "macos" }), "macos");
   assert.equal(resolveShell({ TOKENTRACKER_APP_SHELL: "WINDOWS" }), "windows");
+  assert.equal(resolveShell({ TOKENTRACKER_APP_SHELL: "linux" }), "linux");
   assert.equal(resolveShell({ TOKENTRACKER_APP_SHELL: "evil-value" }), "cli");
 });
 

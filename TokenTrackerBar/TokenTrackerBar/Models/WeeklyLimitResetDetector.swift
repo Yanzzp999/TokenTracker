@@ -220,7 +220,7 @@ extension UsageLimitsResponse {
             }
         }
 
-        addGeneric("cursor", cursor.configured, cursor.error, [("primary", Strings.cursorPlanLabel, cursor.primaryWindow), ("secondary", Strings.cursorAutoLabel, cursor.secondaryWindow), ("tertiary", "API", cursor.tertiaryWindow)])
+        addGeneric("cursor", cursor.configured, cursor.error, [("primary", Strings.cursorPlanLabel, cursor.primaryWindow), ("secondary", Strings.cursorAutoLabel, cursor.secondaryWindow), ("tertiary", "API", cursor.tertiaryWindow), ("quaternary", Strings.cursorGrokBotLabel, cursor.quaternaryWindow)])
         addGeneric("gemini", gemini.configured, gemini.error, [("primary", "Pro", gemini.primaryWindow), ("secondary", "Flash", gemini.secondaryWindow), ("tertiary", "Lite", gemini.tertiaryWindow)])
         addGeneric("kiro", kiro.configured, kiro.error, [("primary", Strings.kiroMonthLabel, kiro.primaryWindow), ("secondary", Strings.kiroBonusLabel, kiro.secondaryWindow)])
         addGeneric("antigravity", antigravity.configured, antigravity.error, [("primary", "Claude 7d", antigravity.primaryWindow), ("secondary", "Claude 5h", antigravity.secondaryWindow), ("tertiary", "Gemini 7d", antigravity.tertiaryWindow), ("quaternary", "Gemini 5h", antigravity.quaternaryWindow)])

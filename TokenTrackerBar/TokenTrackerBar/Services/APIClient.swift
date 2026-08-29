@@ -119,6 +119,14 @@ actor APIClient {
         )
     }
 
+    func fetchSubscriptions() async throws -> [SubscriptionRecord] {
+        let response: SubscriptionListResponse = try await fetch(
+            "/functions/tokentracker-subscription-manager",
+            requestTimeout: Self.usageLimitsRequestTimeout
+        )
+        return response.subscriptions ?? []
+    }
+
     func triggerSync(drain: Bool = false, auto: Bool = false) async throws -> SyncResponse {
         let body: Data
         if drain {

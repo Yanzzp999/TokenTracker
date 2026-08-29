@@ -170,10 +170,18 @@ final class UsageLimitsRetentionTests: XCTestCase {
                     "reset_at": "2026-09-04T03:32:21.000Z",
                     "limit_window_seconds": 2_678_400,
                 ],
+                "quaternary_window": [
+                    "used_percent": 0,
+                    "reset_at": "2026-08-31T10:37:44.547Z",
+                    "limit_window_seconds": 407_741,
+                ],
             ],
         ])
 
         XCTAssertEqual(response.cursor.primaryWindow?.limitWindowSeconds, 2_678_400)
+        XCTAssertEqual(response.cursor.quaternaryWindow?.usedPercent, 0)
+        XCTAssertEqual(response.cursor.quaternaryWindow?.resetAt, "2026-08-31T10:37:44.547Z")
+        XCTAssertEqual(response.cursor.quaternaryWindow?.limitWindowSeconds, 407_741)
     }
 
     func testCodexCreditWindowDecodesSpendControlFields() throws {

@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-08-23T00:50:54.206Z",
+  "generatedAt": "2026-08-28T18:10:04.552Z",
   "root": "dashboard/src",
   "rules": {
     "colors": "hex/rgb(a) literals",
@@ -401,6 +401,13 @@
         "0 && ("
       ]
     },
+    "dashboard/src/ui/dashboard/components/SubscriptionSettingsCard.jsx": {
+      "colors": 0,
+      "rawText": 1,
+      "rawTextTokens": [
+        "item.id === editingId) : null; const editingView = editingSub ? cycleView(editingSub, now) : null; return ("
+      ]
+    },
     "dashboard/src/ui/dashboard/components/TrendMonitor.jsx": {
       "colors": 30,
       "rawText": 5,
@@ -420,9 +427,8 @@
     },
     "dashboard/src/ui/dashboard/components/UsageLimitsPanel.jsx": {
       "colors": 0,
-      "rawText": 2,
+      "rawText": 1,
       "rawTextTokens": [
-        "(prev === id ? null : id)), ), ) .filter(Boolean); return (",
         "0 ? groups :"
       ]
     },

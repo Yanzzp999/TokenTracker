@@ -654,34 +654,35 @@ export default async function (req: Request): Promise<Response> {
 
   // Parse requested periods
   const body = await req.json().catch(() => ({})) as Record<string, unknown>;
-  if (Object.hasOwn(body, "anti_cheat_response_completed_at")) {
+  if (Object.hasOwn(body, "anti_cheat_reconcile_at")) {
     if (authorization !== "privileged")
       return json({ error: "privileged anti-cheat operation required" }, 403);
-    const completedAt = body.anti_cheat_response_completed_at;
+    const queueChangedAt = body.anti_cheat_reconcile_at;
     if (
-      typeof completedAt !== "string" ||
-      !completedAt ||
-      !Number.isFinite(Date.parse(completedAt))
+      typeof queueChangedAt !== "string" ||
+      !queueChangedAt ||
+      !Number.isFinite(Date.parse(queueChangedAt))
     ) {
       return json({ error: "invalid anti-cheat queue timestamp" }, 400);
     }
     const { data, error } = await client.database.rpc(
-      "mark_anticheat_response_completed",
-      { p_queue_changed_at: completedAt },
+      "reconcile_anticheat_snapshot_exclusions",
+      { p_queue_changed_at: queueChangedAt },
     );
     if (error) return json({ error: error.message }, 500);
     const row = Array.isArray(data) && data.length > 0
       ? data[0] as Record<string, unknown>
       : {};
     if (row.applied !== true) {
-      return json({ error: "anti-cheat queue changed during snapshot refresh" }, 409);
+      return json({ error: "anti-cheat queue changed during snapshot reconciliation" }, 409);
     }
     return json({
       ok: true,
+      reconciled_snapshot_rows: Number(row.deleted_rows) || 0,
       last_response_completed_at:
         typeof row.response_completed_at === "string"
           ? row.response_completed_at
-          : completedAt,
+          : queueChangedAt,
     });
   }
   const scanAnomalies = body.scan_anomalies === true;

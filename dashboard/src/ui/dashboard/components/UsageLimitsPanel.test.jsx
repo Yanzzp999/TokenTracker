@@ -260,6 +260,11 @@ describe("UsageLimitsPanel", () => {
             reset_at: "2026-09-04T03:32:21.000Z",
             limit_window_seconds: 31 * 24 * 60 * 60,
           },
+          quaternary_window: {
+            used_percent: 0,
+            reset_at: "2026-08-31T10:37:44.547Z",
+            limit_window_seconds: 407741,
+          },
         }}
         order={["cursor"]}
       />,
@@ -267,6 +272,8 @@ describe("UsageLimitsPanel", () => {
 
     const group = screen.getByText("Cursor").closest("[role='button']");
     expect(group).not.toBeNull();
+    expect(within(group).getByText(copy("limits.label.cursor_grok_bot"))).toBeInTheDocument();
+    expect(within(group).getByText("0%")).toBeInTheDocument();
     expect(group.querySelectorAll("div.absolute.top-0.h-full")).toHaveLength(2);
     fireEvent.click(group);
     expect(within(group).getByText(copy("limits.explain.body"))).toBeInTheDocument();
@@ -694,5 +701,56 @@ describe("UsageLimitsPanel", () => {
     expect(codexGroupElement.querySelector("[data-reset-bank-section]")).toBeNull();
     expect(within(codexGroupElement).queryByText(copy("limits.codex_reset_bank.title"))).not.toBeInTheDocument();
     expect(within(codexGroupElement).queryByText(copy("limits.codex_reset_bank.row_label", { index: 1 }))).not.toBeInTheDocument();
+  });
+
+  it("renders an inline subscription bar, badge and detail for a linked provider", () => {
+    const subscription = {
+      id: "s1",
+      service: "Cursor",
+      plan: "Pro",
+      provider: "cursor",
+      autoRenew: true,
+      nextBillingAt: new Date(Date.now() + 2 * 86400000).toISOString(),
+    };
+
+    render(
+      <UsageLimitsPanel
+        cursor={{
+          configured: true,
+          error: null,
+          primary_window: { used_percent: 50, reset_at: "2026-05-10T10:39:54.000Z" },
+        }}
+        order={["cursor"]}
+        subscriptions={[subscription]}
+      />,
+    );
+
+    expect(screen.getByText("Cursor")).toBeInTheDocument();
+    // Collapsed: top-right auto-renew icon badge and the "Subscription" bar label.
+    expect(screen.getByRole("img", { name: "Auto-renew" })).toBeInTheDocument();
+    expect(screen.getByText("Subscription")).toBeInTheDocument();
+
+    // Expanding reveals the subscription detail line.
+    fireEvent.click(screen.getByText("Cursor").closest("[role='button']"));
+    expect(screen.getByText("Next renewal")).toBeInTheDocument();
+    expect(screen.getByText("Auto-renew on")).toBeInTheDocument();
+  });
+
+  it("does not render subscription rows for a provider without a linked subscription", () => {
+    render(
+      <UsageLimitsPanel
+        cursor={{
+          configured: true,
+          error: null,
+          primary_window: { used_percent: 50, reset_at: "2026-05-10T10:39:54.000Z" },
+        }}
+        order={["cursor"]}
+        subscriptions={[]}
+      />,
+    );
+
+    expect(screen.getByText("Cursor")).toBeInTheDocument();
+    expect(screen.queryByText("Auto-renew")).not.toBeInTheDocument();
+    expect(screen.queryByText("Subscription")).not.toBeInTheDocument();
   });
 });

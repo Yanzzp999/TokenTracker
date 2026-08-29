@@ -118,15 +118,21 @@ test("resolveTraeCnHome honors TOKENTRACKER_TRAE_CN_HOME override", () => {
   assert.equal(fallback, path.join("/Users/t", "Library", "Application Support", CN_APP_DIR));
 });
 
-test("resolveTraeCnHome resolves the macOS default and rejects other platforms", () => {
-  const home = "/Users/tester";
+test("resolveTraeCnHome resolves the macOS and Windows defaults", () => {
+  const darwinHome = "/Users/tester";
   assert.equal(
-    resolveTraeCnHome({ platform: "darwin", home }),
-    path.join(home, "Library", "Application Support", CN_APP_DIR),
+    resolveTraeCnHome({ platform: "darwin", home: darwinHome }),
+    path.join(darwinHome, "Library", "Application Support", CN_APP_DIR),
   );
-  // Phase A is macOS + test-injected paths only.
-  assert.equal(resolveTraeCnHome({ platform: "win32", home, env: {} }), null);
-  assert.equal(resolveTraeCnHome({ platform: "linux", home, env: {} }), null);
+  // Windows keeps the CN Work app under APPDATA (or the roaming profile).
+  const winHome = "C:\\Users\\tester";
+  const appData = "C:\\Users\\tester\\AppData\\Roaming";
+  assert.equal(
+    resolveTraeCnHome({ platform: "win32", home: winHome, env: { APPDATA: appData } }),
+    path.join(appData, CN_APP_DIR),
+  );
+  // No verified CN Work app-data layout on other platforms yet.
+  assert.equal(resolveTraeCnHome({ platform: "linux", home: darwinHome, env: {} }), null);
 });
 
 test("resolveTraeCnStoragePath points at User/globalStorage/storage.json", () => {
@@ -139,7 +145,10 @@ test("resolveTraeCnStoragePath points at User/globalStorage/storage.json", () =>
     resolveTraeCnStoragePath({ platform: "darwin", home: "/Users/tester", env: {} }),
     path.join("/Users/tester", "Library", "Application Support", CN_APP_DIR, "User", "globalStorage", "storage.json"),
   );
-  assert.equal(resolveTraeCnStoragePath({ platform: "win32", home: "/Users/tester", env: {} }), null);
+  assert.equal(
+    resolveTraeCnStoragePath({ platform: "win32", home: "C:\\Users\\tester", env: { APPDATA: "C:\\Users\\tester\\AppData\\Roaming" } }),
+    path.join("C:\\Users\\tester\\AppData\\Roaming", CN_APP_DIR, "User", "globalStorage", "storage.json"),
+  );
 });
 
 // ---------------------------------------------------------------------------

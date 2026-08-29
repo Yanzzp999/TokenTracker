@@ -6,7 +6,7 @@
  * Privacy contract (documented in README "Privacy" section — keep in sync):
  * the payload carries exactly four fields — a one-way sha256 hash of the
  * machine id, the app version, `process.platform`, and the app shell
- * (cli / macos / windows). No token counts, no model names, no usernames,
+ * (cli / macos / windows / linux). No token counts, no model names, no usernames,
  * no paths. Opt out with TOKENTRACKER_NO_TELEMETRY=1, the DO_NOT_TRACK
  * standard, or `"telemetry": false` in config.json.
  */
@@ -35,7 +35,7 @@ const MACHINE_HASH_NAMESPACE = "tokentracker-telemetry-v1:";
 // cloud host; sync awaits this at most once per day so the worst-case stall
 // is bounded and rare.
 const DEFAULT_TIMEOUT_MS = 10_000;
-const VALID_SHELLS = new Set(["cli", "macos", "windows"]);
+const VALID_SHELLS = new Set(["cli", "macos", "windows", "linux"]);
 
 const THROTTLE_CONFIG = {
   intervalMs: HEARTBEAT_INTERVAL_MS,

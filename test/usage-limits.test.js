@@ -12,6 +12,7 @@ const {
   normalizePlanLabel,
   loadKimiCredentials,
   normalizeCursorUsageSummary,
+  normalizeCursorSandUsageStatus,
   normalizeGeminiQuotaResponse,
   normalizeKimiUsageResponse,
   parseKiroUsageOutput,
@@ -25,6 +26,7 @@ const {
   detectAntigravityProcess,
   fetchAntigravityLimits,
   fetchCopilotLimits,
+  describeCopilotOtelStatus,
 } = require("../src/lib/usage-limits");
 const { writeArkCodingPlanLimitsCache } = require("../src/lib/ark-coding-plan-limits");
 
@@ -308,6 +310,27 @@ function copilotTokenHex(token = makeCopilotTestToken()) {
 }
 
 describe("fetchCopilotLimits", () => {
+  it("detects VS Code Copilot files under .copilot-otel", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-copilot-otel-status-"));
+    try {
+      const chatDir = path.join(tmp, ".copilot-otel");
+      fs.mkdirSync(chatDir, { recursive: true });
+      fs.writeFileSync(path.join(chatDir, "copilot.jsonl"), "", "utf8");
+
+      const result = describeCopilotOtelStatus({ home: tmp, env: { HOME: tmp } });
+      assert.equal(result.otel_has_files, true);
+      assert.deepEqual(result.otel_default_dirs, [
+        path.join(tmp, ".copilot", "otel"),
+        chatDir,
+      ]);
+      assert.deepEqual(result.otel_detected_paths, [
+        path.join(chatDir, "copilot.jsonl"),
+      ]);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it("fetches Copilot limits with a schema-v0 auth.db token", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-copilot-limits-v0-"));
     try {
@@ -2663,6 +2686,45 @@ describe("normalizeCursorUsageSummary", () => {
 
     assert.ok(result.primary_window.used_percent > 0);
     assert.ok(result.primary_window.used_percent < 1);
+  });
+});
+
+describe("normalizeCursorSandUsageStatus", () => {
+  it("maps the official Grok Bot period to an independent exact-duration window", () => {
+    const result = normalizeCursorSandUsageStatus({
+      currentPeriodStart: "2026-08-26T17:22:03.913Z",
+      nextResetAt: "2026-08-31T10:37:44.547Z",
+      usagePercent: 0,
+      includedLimitZero: false,
+      hasNonZeroIncludedLimit: true,
+    });
+
+    assert.deepEqual(result, {
+      used_percent: 0,
+      reset_at: "2026-08-31T10:37:44.547Z",
+      limit_window_seconds: 407741,
+    });
+  });
+
+  it("hides Grok Bot for ineligible accounts", () => {
+    assert.equal(normalizeCursorSandUsageStatus({
+      currentPeriodStart: "2026-08-25T00:00:00.000Z",
+      nextResetAt: "2026-09-01T00:00:00.000Z",
+      usagePercent: 10,
+    }, { eligible: false }), null);
+  });
+
+  it("hides zero-limit and malformed responses without fabricating a quota", () => {
+    assert.equal(normalizeCursorSandUsageStatus({
+      nextResetAt: "2026-09-01T00:00:00.000Z",
+      usagePercent: 10,
+      includedLimitZero: true,
+    }), null);
+    assert.equal(normalizeCursorSandUsageStatus({ usagePercent: 10 }), null);
+    assert.equal(normalizeCursorSandUsageStatus({
+      nextResetAt: "2026-09-01T00:00:00.000Z",
+      usagePercent: "unknown",
+    }), null);
   });
 });
 

@@ -65,6 +65,7 @@ enum Strings {
     static var allProvidersHidden: String { t("All providers hidden", "所有提供方均已隐藏", "所有提供方均已隱藏", "すべてのプロバイダーが非表示です", "모든 제공자가 숨겨졌습니다") }
     static var cursorPlanLabel: String { t("Plan", "套餐", "套餐", "プラン", "플랜") }
     static var cursorAutoLabel: String { t("Auto", "自动", "自動", "自動", "자동") }
+    static var cursorGrokBotLabel: String { t("Grok Bot", "Grok 机器人", "Grok 機器人", "Grokボット", "Grok 봇") }
     static var codexCreditsLabel: String { t("Credits", "额度", "額度", "クレジット", "크레딧") }
     static var kimiWeeklyLabel: String { t("Weekly", "周", "周", "週間", "주간") }
     static var kimiFiveHourLabel: String { t("5h", "5h", "5h", "5h", "5h") }
@@ -192,6 +193,12 @@ enum Strings {
     static var limitsDisplayTitle: String { t("Limit Display", "限额显示", "限額顯示", "上限の表示", "한도 표시") }
     static var toastOnResetLabel: String { t("Toast on limits reset", "额度重置时显示提示", "額度重置時顯示提示", "リセット時に通知を表示", "한도 초기화 시 알림 표시") }
     static var confettiOnResetLabel: String { t("Confetti on limits reset", "额度重置时撒花", "額度重置時撒花", "リセット時に紙吹雪", "한도 초기화 시 색종이") }
+    static var showSubscriptionsLabel: String { t("Show subscriptions", "显示订阅", "顯示訂閱", "サブスクを表示", "구독 표시") }
+    static var showSubscriptionsHint: String { t("Show renewal progress alongside limits", "在限额旁显示订阅续费进度", "在限額旁顯示訂閱續費進度", "上限と並べて更新の進捗を表示", "한도 옆에 구독 갱신 진행률 표시") }
+    static var subscriptionLabel: String { t("Subscription", "订阅", "訂閱", "サブスク", "구독") }
+    static var subscriptionExpired: String { t("Expired", "已过期", "已過期", "期限切れ", "만료됨") }
+    static var subscriptionAutoRenewBadge: String { t("Auto-renew", "自动续费", "自動續費", "自動更新", "자동 갱신") }
+    static var subscriptionStopsBadge: String { t("Stops at expiry", "到期停止", "到期停止", "期限で停止", "만료 시 중지") }
     /// Toast shown with the celebration firework. `provider` is a display name (e.g. "Claude");
     /// `window` names the specific window that rolled over (e.g. "5h", "Gemini 5h"); nil = generic.
     static func limitResetCelebration(provider: String?, window: String? = nil) -> String {

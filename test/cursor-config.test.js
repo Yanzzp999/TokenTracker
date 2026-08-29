@@ -10,9 +10,14 @@ const {
   normalizeCursorUsage,
   isCursorInstalled,
   readCursorAccessTokenFromStateDb,
+  extractCursorAuth,
   extractCursorSessionToken,
   resolveCursorPaths,
   fetchCursorUsageCsv,
+  decodeCursorSandAccessStatus,
+  decodeCursorSandUsageStatus,
+  fetchCursorSandAccessStatus,
+  fetchCursorSandUsageStatus,
 } = require("../src/lib/cursor-config");
 
 function makeCursorJwt(userId = "user_TEST123") {
@@ -425,6 +430,26 @@ describe("extractCursorSessionToken", () => {
     });
   });
 
+  it("exposes the bearer token only through the full Cursor auth helper", () => {
+    const jwt = makeCursorJwt("user_RPC");
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-cursor-rpc-auth-"));
+    const { stateDbPath } = resolveCursorPaths({ home, env: {} });
+    fs.mkdirSync(path.dirname(stateDbPath), { recursive: true });
+    fs.writeFileSync(stateDbPath, "", "utf8");
+    const deps = {
+      execFileSync: () => JSON.stringify([{ value: jwt }]),
+      requireFn: () => { throw new Error("sqlite3 CLI used"); },
+      env: {},
+    };
+
+    assert.deepEqual(extractCursorAuth({ home, env: {}, deps }), {
+      cookie: `WorkosCursorSessionToken=user_RPC%3A%3A${jwt}`,
+      userId: "user_RPC",
+      accessToken: jwt,
+    });
+    assert.equal(Object.hasOwn(extractCursorSessionToken({ home, env: {}, deps }), "accessToken"), false);
+  });
+
   it("accepts Google OAuth subject from cli-config.json (issue #88)", () => {
     const subject = "google-oauth2|105551234567890123456";
     const header = Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url");
@@ -560,6 +585,138 @@ function jsonLikeResponse({ status, body = "", headers = {} }) {
     },
   };
 }
+
+function protoVarint(value) {
+  let remaining = BigInt(value);
+  const bytes = [];
+  do {
+    let byte = Number(remaining & 0x7fn);
+    remaining >>= 7n;
+    if (remaining > 0n) byte |= 0x80;
+    bytes.push(byte);
+  } while (remaining > 0n);
+  return Buffer.from(bytes);
+}
+
+function protoVarintField(fieldNumber, value) {
+  return Buffer.concat([protoVarint(BigInt(fieldNumber) << 3n), protoVarint(value)]);
+}
+
+function protoBytesField(fieldNumber, value) {
+  const body = Buffer.from(value);
+  return Buffer.concat([
+    protoVarint((BigInt(fieldNumber) << 3n) | 2n),
+    protoVarint(body.length),
+    body,
+  ]);
+}
+
+function protoDoubleField(fieldNumber, value) {
+  const body = Buffer.alloc(8);
+  body.writeDoubleLE(value, 0);
+  return Buffer.concat([protoVarint((BigInt(fieldNumber) << 3n) | 1n), body]);
+}
+
+function protoTimestamp(iso) {
+  const milliseconds = Date.parse(iso);
+  const seconds = Math.floor(milliseconds / 1000);
+  const nanos = (milliseconds - seconds * 1000) * 1_000_000;
+  return Buffer.concat([protoVarintField(1, seconds), protoVarintField(2, nanos)]);
+}
+
+function binaryResponse({ status = 200, body = Buffer.alloc(0), contentType = "application/proto" } = {}) {
+  const bytes = Buffer.from(body);
+  return {
+    status,
+    headers: new Headers({ "content-type": contentType }),
+    async arrayBuffer() {
+      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    },
+  };
+}
+
+describe("Cursor Grok Bot protobuf RPC", () => {
+  const accessToken = "cursor-access-token";
+  const usageBody = Buffer.concat([
+    protoBytesField(1, protoTimestamp("2026-08-26T17:22:03.913Z")),
+    protoBytesField(2, protoTimestamp("2026-08-31T10:37:44.547Z")),
+    protoDoubleField(3, 0),
+    protoVarintField(5, 2),
+    protoVarintField(7, 1),
+    protoVarintField(8, 1),
+    // Unknown length-delimited fields must remain forward-compatible.
+    protoBytesField(12, Buffer.from("ignored")),
+  ]);
+
+  it("decodes access eligibility and ignores newer response fields", () => {
+    const body = Buffer.concat([
+      protoVarintField(1, 1),
+      protoVarintField(3, 1),
+      protoBytesField(4, Buffer.from("pro")),
+      protoVarintField(11, 1),
+    ]);
+    assert.deepEqual(decodeCursorSandAccessStatus(body), {
+      state: 1,
+      blockReason: 1,
+      granted: true,
+    });
+  });
+
+  it("decodes zero-percent usage, exact timestamps, and reset metadata", () => {
+    assert.deepEqual(decodeCursorSandUsageStatus(usageBody), {
+      currentPeriodStart: "2026-08-26T17:22:03.913Z",
+      nextResetAt: "2026-08-31T10:37:44.547Z",
+      usagePercent: 0,
+      includedLimitZero: false,
+      availableBankedResetCount: 2,
+      usesPooledEnterpriseAllowance: false,
+      hasAvailableUsage: true,
+      hasNonZeroIncludedLimit: true,
+    });
+  });
+
+  it("calls only the pinned read-only RPCs with an empty protobuf body", async () => {
+    const calls = [];
+    const fetchImpl = async (url, init) => {
+      calls.push({ url: String(url), init });
+      if (String(url).endsWith("/GetSandAccessStatus")) {
+        return binaryResponse({ body: protoVarintField(1, 1) });
+      }
+      return binaryResponse({ body: usageBody });
+    };
+
+    assert.equal((await fetchCursorSandAccessStatus({ accessToken, fetchImpl })).granted, true);
+    assert.equal((await fetchCursorSandUsageStatus({ accessToken, fetchImpl })).usagePercent, 0);
+    assert.equal(calls.length, 2);
+    for (const call of calls) {
+      assert.match(call.url, /^https:\/\/api2\.cursor\.sh\/aiserver\.v1\.DashboardService\/GetSand(?:Access|Usage)Status$/);
+      assert.equal(call.init.method, "POST");
+      assert.equal(call.init.redirect, "error");
+      assert.equal(call.init.headers.Authorization, `Bearer ${accessToken}`);
+      assert.equal(call.init.headers["Content-Type"], "application/proto");
+      assert.equal(call.init.headers["Connect-Protocol-Version"], "1");
+      assert.equal(Buffer.from(call.init.body).length, 0);
+      assert.ok(call.init.signal);
+    }
+  });
+
+  it("rejects expired auth and non-protobuf responses", async () => {
+    await assert.rejects(
+      () => fetchCursorSandUsageStatus({
+        accessToken,
+        fetchImpl: async () => binaryResponse({ status: 401 }),
+      }),
+      { message: "Cursor session expired — re-login in Cursor to refresh" },
+    );
+    await assert.rejects(
+      () => fetchCursorSandUsageStatus({
+        accessToken,
+        fetchImpl: async () => binaryResponse({ contentType: "text/html" }),
+      }),
+      { message: "Cursor API returned an unexpected response type" },
+    );
+  });
+});
 
 function assertCsvRequestInit(init, { redirect = "manual" } = {}) {
   assert.ok(init);
