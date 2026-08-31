@@ -20,6 +20,8 @@ const {
   runCommand,
   resetUsageLimitsCache,
   normalizeAntigravityResponse,
+  normalizeAntigravityQuotaSummary,
+  loadAntigravityCredentials,
   parseListeningPorts,
   parseWindowsListeningPorts,
   listAntigravityPorts,
@@ -199,25 +201,109 @@ describe("getUsageLimits gemini no-creds", () => {
   });
 });
 
+function writeAntigravityOauthToken(tmp, token = {}) {
+  const credPath = path.join(tmp, ".gemini", "jetski-standalone-oauth-token");
+  fs.mkdirSync(path.dirname(credPath), { recursive: true });
+  fs.writeFileSync(
+    credPath,
+    JSON.stringify({
+      token: {
+        access_token: "ya29.agy-live",
+        refresh_token: "1//agy-refresh",
+        expiry: "2099-01-01T00:00:00Z",
+        token_type: "Bearer",
+        ...token,
+      },
+      auth_method: "consumer",
+    }),
+    { encoding: "utf8", mode: 0o600 },
+  );
+  return credPath;
+}
+
+function antigravityQuotaSummaryPayload() {
+  return {
+    groups: [
+      {
+        displayName: "Claude and GPT models",
+        buckets: [
+          { bucketId: "3p-weekly", remainingFraction: 0.58, resetTime: "2026-09-07T00:00:00Z" },
+          { bucketId: "3p-5h", remainingFraction: 0.82, resetTime: "2026-08-31T10:00:00Z" },
+        ],
+      },
+      {
+        displayName: "Gemini Models",
+        buckets: [
+          { bucketId: "gemini-weekly", remainingFraction: 0.4, resetTime: "2026-09-07T00:00:00Z" },
+          { bucketId: "gemini-5h", remainingFraction: 0.9, resetTime: "2026-08-31T10:00:00Z" },
+        ],
+      },
+    ],
+  };
+}
+
+function antigravityRemoteFetchImpl({
+  quota = antigravityQuotaSummaryPayload(),
+  refresh = { access_token: "ya29.agy-refreshed", expires_in: 3600 },
+  load = { paidTier: { name: "Google AI Pro", id: "pro" } },
+  quotaStatus = 200,
+  calls = [],
+} = {}) {
+  return async (url) => {
+    const href = String(url);
+    calls.push(href);
+    if (href.includes("oauth2.googleapis.com/token")) {
+      return { ok: true, status: 200, async json() { return refresh; } };
+    }
+    if (href.includes("loadCodeAssist")) {
+      return { ok: true, status: 200, async json() { return load; } };
+    }
+    if (href.includes("retrieveUserQuotaSummary")) {
+      return {
+        ok: quotaStatus === 200,
+        status: quotaStatus,
+        async json() { return quota; },
+      };
+    }
+    return { ok: false, status: 404, async json() { return {}; } };
+  };
+}
+
 describe("getUsageLimits antigravity cache", () => {
-  it("shows message when no language server and no cache", async () => {
+  it("reads remaining quota from Cloud Code when OAuth credentials exist", async () => {
+    resetUsageLimitsCache();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-limits-antigravity-remote-"));
+    try {
+      writeAntigravityOauthToken(tmp);
+      const fetchCalls = [];
+      const result = await getUsageLimits({
+        home: tmp,
+        platform: "linux",
+        providerTimeoutMs: 1000,
+        securityRunner() { return { status: 1, stdout: "" }; },
+        commandRunner() { return { status: 1, stdout: "" }; },
+        fetchImpl: antigravityRemoteFetchImpl({ calls: fetchCalls }),
+      });
+
+      assert.equal(result.antigravity.configured, true);
+      assert.equal(result.antigravity.error, null);
+      assert.equal(result.antigravity.cached, undefined);
+      assert.equal(result.antigravity.primary_window.used_percent, 42);
+      assert.equal(result.antigravity.secondary_window.used_percent, 18);
+      assert.equal(result.antigravity.tertiary_window.used_percent, 60);
+      assert.equal(result.antigravity.quaternary_window.used_percent, 10);
+      assert.ok(fetchCalls.some((url) => url.includes("daily-cloudcode-pa.googleapis.com")));
+    } finally {
+      resetUsageLimitsCache();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("shows message when no language server, no credentials, and no cache", async () => {
     resetUsageLimitsCache();
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-limits-antigravity-noprocess-"));
     try {
-      const agyHome = path.join(tmp, ".gemini", "antigravity-cli");
-      fs.mkdirSync(agyHome, { recursive: true });
-      fs.writeFileSync(
-        path.join(agyHome, "antigravity-oauth-token"),
-        JSON.stringify({
-          token: {
-            access_token: "ya29.agy-gemini-test",
-            refresh_token: "1//agy-refresh",
-            expiry: "2099-01-01T00:00:00Z",
-          },
-          auth_method: "consumer",
-        }),
-        "utf8",
-      );
+      fs.mkdirSync(path.join(tmp, ".gemini", "antigravity-cli"), { recursive: true });
 
       const result = await getUsageLimits({
         home: tmp,
@@ -3080,6 +3166,97 @@ describe("normalizeAntigravityResponse", () => {
   });
 });
 
+describe("normalizeAntigravityQuotaSummary", () => {
+  it("accepts the Cloud Code HTTP payload with top-level groups", () => {
+    const result = normalizeAntigravityQuotaSummary(antigravityQuotaSummaryPayload());
+    assert.equal(result.primary_window.used_percent, 42);
+    assert.equal(result.secondary_window.used_percent, 18);
+    assert.equal(result.tertiary_window.used_percent, 60);
+    assert.equal(result.quaternary_window.used_percent, 10);
+    assert.equal(result.primary_window.reset_at, "2026-09-07T00:00:00.000Z");
+  });
+
+  it("still accepts the local Connect-RPC wrapper", () => {
+    const result = normalizeAntigravityQuotaSummary({
+      code: 0,
+      response: antigravityQuotaSummaryPayload(),
+    });
+    assert.equal(result.primary_window.used_percent, 42);
+    assert.equal(result.quaternary_window.used_percent, 10);
+  });
+});
+
+describe("loadAntigravityCredentials", () => {
+  it("reads jetski-standalone-oauth-token nested token objects", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-agy-creds-jetski-"));
+    try {
+      writeAntigravityOauthToken(tmp);
+      const creds = loadAntigravityCredentials({ home: tmp, platform: "linux" });
+      assert.equal(creds.accessToken, "ya29.agy-live");
+      assert.equal(creds.refreshToken, "1//agy-refresh");
+      assert.equal(creds.source, "file");
+      assert.match(creds.path, /jetski-standalone-oauth-token$/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("reads antigravity-cli/antigravity-oauth-token", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-agy-creds-cli-"));
+    try {
+      const credPath = path.join(tmp, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+      fs.mkdirSync(path.dirname(credPath), { recursive: true });
+      fs.writeFileSync(credPath, JSON.stringify({
+        token: { access_token: "ya29.cli", refresh_token: "1//cli", expiry: "2099-01-01T00:00:00Z" },
+      }), "utf8");
+      const creds = loadAntigravityCredentials({ home: tmp, platform: "linux" });
+      assert.equal(creds.accessToken, "ya29.cli");
+      assert.equal(creds.source, "file");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("does not treat Gemini CLI oauth_creds.json as Antigravity credentials", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-agy-creds-gemini-"));
+    try {
+      const geminiDir = path.join(tmp, ".gemini");
+      fs.mkdirSync(geminiDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(geminiDir, "oauth_creds.json"),
+        JSON.stringify({ access_token: "ya29.gemini-cli", refresh_token: "1//gemini", expiry_date: Date.now() + 3_600_000 }),
+        "utf8",
+      );
+      const creds = loadAntigravityCredentials({ home: tmp, platform: "linux" });
+      assert.equal(creds, null);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("reads the macOS Keychain via securityRunner", () => {
+    const payload = JSON.stringify({
+      token: {
+        access_token: "ya29.keychain",
+        refresh_token: "1//keychain",
+        expiry: "2099-01-01T00:00:00Z",
+      },
+    });
+    const creds = loadAntigravityCredentials({
+      home: path.join(os.tmpdir(), "tokentracker-agy-no-home"),
+      platform: "darwin",
+      securityRunner(bin, args) {
+        assert.equal(bin, "/usr/bin/security");
+        assert.ok(args.includes("gemini"));
+        assert.ok(args.includes("antigravity"));
+        return { status: 0, stdout: `${payload}\n` };
+      },
+    });
+    assert.equal(creds.accessToken, "ya29.keychain");
+    assert.equal(creds.source, "keychain");
+  });
+});
+
 describe("Antigravity helpers", () => {
   it("parses listening ports", () => {
     const output = `
@@ -3326,7 +3503,13 @@ lang 123 me 22u IPv4 0x123 0t0 TCP 127.0.0.1:51234 (LISTEN)
         };
       };
 
-      const result = await fetchAntigravityLimits({ home: tmp, commandRunner, requestFn, nowMs });
+      const result = await fetchAntigravityLimits({
+        platform: "linux",
+        home: tmp,
+        commandRunner,
+        requestFn,
+        nowMs,
+      });
       assert.equal(result.configured, true);
       assert.equal(result.primary_window.used_percent, 75);
 
@@ -3360,6 +3543,7 @@ lang 123 me 22u IPv4 0x123 0t0 TCP 127.0.0.1:51234 (LISTEN)
       const commandRunner = () => ({ stdout: "", stderr: "", status: 1 });
 
       const result = await fetchAntigravityLimits({
+        platform: "linux",
         home: tmp,
         commandRunner,
         nowMs: Date.parse("2026-05-21T01:00:00.000Z"),
@@ -3422,6 +3606,7 @@ lang 123 me 22u IPv4 0x123 0t0 TCP 127.0.0.1:51234 (LISTEN)
       };
 
       const result = await fetchAntigravityLimits({
+        platform: "linux",
         home: tmp,
         commandRunner,
         requestFn,
@@ -3462,6 +3647,7 @@ lang 123 me 22u IPv4 0x123 0t0 TCP 127.0.0.1:51234 (LISTEN)
       const commandRunner = () => ({ stdout: "", stderr: "", status: 1 });
 
       const result = await fetchAntigravityLimits({
+        platform: "linux",
         home: tmp,
         commandRunner,
         nowMs: Date.parse("2026-05-21T01:00:00.000Z"),
@@ -3480,6 +3666,7 @@ lang 123 me 22u IPv4 0x123 0t0 TCP 127.0.0.1:51234 (LISTEN)
       const commandRunner = () => ({ stdout: "", stderr: "", status: 1 });
 
       const result = await fetchAntigravityLimits({
+        platform: "linux",
         home: tmp,
         commandRunner,
         nowMs: Date.parse("2026-05-21T01:00:00.000Z"),
@@ -3500,6 +3687,7 @@ lang 123 me 22u IPv4 0x123 0t0 TCP 127.0.0.1:51234 (LISTEN)
       const commandRunner = () => ({ stdout: "", stderr: "", status: 1 });
 
       const result = await fetchAntigravityLimits({
+        platform: "linux",
         home: tmp,
         commandRunner,
         nowMs: Date.parse("2026-05-21T01:00:00.000Z"),
@@ -3507,6 +3695,195 @@ lang 123 me 22u IPv4 0x123 0t0 TCP 127.0.0.1:51234 (LISTEN)
 
       assert.equal(result.configured, true);
       assert.ok(result.error.includes("not running"), `expected "not running" message, got: ${result.error}`);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("fetchAntigravityLimits remote OAuth", () => {
+  it("fetches remaining quota without a language server process", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-agy-remote-live-"));
+    try {
+      writeAntigravityOauthToken(tmp);
+      const calls = [];
+      const result = await fetchAntigravityLimits({
+        platform: "linux",
+        home: tmp,
+        commandRunner() { return { status: 1, stdout: "" }; },
+        fetchImpl: antigravityRemoteFetchImpl({ calls }),
+        nowMs: Date.parse("2026-08-31T00:00:00.000Z"),
+      });
+      assert.equal(result.configured, true);
+      assert.equal(result.error, null);
+      assert.equal(result.primary_window.used_percent, 42);
+      assert.equal(result.account_plan, "Google AI Pro");
+      assert.equal(calls[0], "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary");
+      assert.ok(!calls.some((url) => url.includes("oauth2.googleapis.com/token")));
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("refreshes an expired access token before calling Cloud Code", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-agy-remote-refresh-"));
+    try {
+      const credPath = writeAntigravityOauthToken(tmp, { expiry: "2026-08-01T00:00:00Z" });
+      const calls = [];
+      const result = await fetchAntigravityLimits({
+        platform: "linux",
+        home: tmp,
+        commandRunner() { return { status: 1, stdout: "" }; },
+        fetchImpl: antigravityRemoteFetchImpl({
+          calls,
+          refresh: { access_token: "ya29.agy-refreshed", expires_in: 3600 },
+        }),
+        nowMs: Date.parse("2026-08-31T00:00:00.000Z"),
+      });
+      assert.equal(result.configured, true);
+      assert.equal(result.primary_window.used_percent, 42);
+      assert.equal(calls[0], "https://oauth2.googleapis.com/token");
+      assert.ok(calls.includes("https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"));
+      const saved = JSON.parse(fs.readFileSync(credPath, "utf8"));
+      assert.equal(saved.token.access_token, "ya29.agy-refreshed");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("retries after 401 by refreshing the access token", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-agy-remote-401-"));
+    try {
+      writeAntigravityOauthToken(tmp);
+      let quotaCalls = 0;
+      const result = await fetchAntigravityLimits({
+        platform: "linux",
+        home: tmp,
+        commandRunner() { return { status: 1, stdout: "" }; },
+        async fetchImpl(url) {
+          const href = String(url);
+          if (href.includes("oauth2.googleapis.com/token")) {
+            return { ok: true, status: 200, async json() { return { access_token: "ya29.after-401", expires_in: 3600 }; } };
+          }
+          if (href.includes("retrieveUserQuotaSummary")) {
+            quotaCalls += 1;
+            if (quotaCalls === 1) {
+              return { ok: false, status: 401, async json() { return {}; } };
+            }
+            return { ok: true, status: 200, async json() { return antigravityQuotaSummaryPayload(); } };
+          }
+          if (href.includes("loadCodeAssist")) {
+            return { ok: true, status: 200, async json() { return {}; } };
+          }
+          return { ok: false, status: 404, async json() { return {}; } };
+        },
+        nowMs: Date.parse("2026-08-31T00:00:00.000Z"),
+      });
+      assert.equal(result.configured, true);
+      assert.equal(result.primary_window.used_percent, 42);
+      assert.equal(quotaCalls, 2);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to the local language server when Cloud Code fails", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-agy-remote-fallback-"));
+    try {
+      writeAntigravityOauthToken(tmp);
+      const commandRunner = (command) => {
+        if (command === "/bin/ps") {
+          return {
+            stdout: `
+123 /Applications/Antigravity.app/Contents/MacOS/language_server_macos --app_data_dir antigravity --csrf_token abc123 --extension_server_port 42427
+`,
+            status: 0,
+          };
+        }
+        if (command === "which") {
+          return { stdout: "/usr/bin/lsof\n", status: 0 };
+        }
+        if (String(command).endsWith("lsof")) {
+          return { stdout: "lang 123 me 22u IPv4 0x123 0t0 TCP 127.0.0.1:51234 (LISTEN)\n", status: 0 };
+        }
+        return { stdout: "", stderr: "", status: 1 };
+      };
+      const requestFn = async ({ path: requestPath }) => {
+        if (requestPath.includes("GetUnleashData")) return { code: 0 };
+        if (requestPath.includes("RetrieveUserQuotaSummary")) {
+          return {
+            code: 0,
+            response: antigravityQuotaSummaryPayload(),
+          };
+        }
+        throw new Error(`unexpected ${requestPath}`);
+      };
+      const result = await fetchAntigravityLimits({
+        platform: "linux",
+        home: tmp,
+        commandRunner,
+        requestFn,
+        async fetchImpl() {
+          return { ok: false, status: 503, async json() { return {}; } };
+        },
+        nowMs: Date.parse("2026-08-31T00:00:00.000Z"),
+      });
+      assert.equal(result.configured, true);
+      assert.equal(result.error, null);
+      assert.equal(result.primary_window.used_percent, 42);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to last-good cache when Cloud Code fails and the IDE is closed", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-agy-remote-cache-"));
+    try {
+      writeAntigravityOauthToken(tmp);
+      const trackerDir = path.join(tmp, ".tokentracker", "tracker");
+      fs.mkdirSync(trackerDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(trackerDir, "usage-limits-cache.json"),
+        JSON.stringify({
+          antigravity: {
+            primary_window: { used_percent: 33, reset_at: "2099-01-01T00:00:00.000Z" },
+            cached_at: "2026-08-31T00:00:00.000Z",
+          },
+        }),
+        "utf8",
+      );
+      const result = await fetchAntigravityLimits({
+        platform: "linux",
+        home: tmp,
+        commandRunner() { return { status: 1, stdout: "" }; },
+        async fetchImpl() {
+          return { ok: false, status: 503, async json() { return {}; } };
+        },
+        nowMs: Date.parse("2026-08-31T01:00:00.000Z"),
+      });
+      assert.equal(result.configured, true);
+      assert.equal(result.cached, true);
+      assert.equal(result.primary_window.used_percent, 33);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers the daily Cloud Code host over the unprefixed host", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-agy-remote-host-"));
+    try {
+      writeAntigravityOauthToken(tmp);
+      const calls = [];
+      await fetchAntigravityLimits({
+        platform: "linux",
+        home: tmp,
+        commandRunner() { return { status: 1, stdout: "" }; },
+        fetchImpl: antigravityRemoteFetchImpl({ calls }),
+        nowMs: Date.parse("2026-08-31T00:00:00.000Z"),
+      });
+      const quotaCalls = calls.filter((url) => url.includes("retrieveUserQuotaSummary"));
+      assert.equal(quotaCalls[0], "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary");
+      assert.ok(!quotaCalls.includes("https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"));
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

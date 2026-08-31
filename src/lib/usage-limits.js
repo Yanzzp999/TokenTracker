@@ -55,6 +55,23 @@ const DEFAULT_PROVIDER_TIMEOUT_MS = 15_000;
 const ANTIGRAVITY_LIMITS_CACHE_FILE = "usage-limits-cache.json";
 const ANTIGRAVITY_LIMITS_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const ANTIGRAVITY_LIMITS_CACHE_UNKNOWN_RESET_TTL_MS = 12 * 60 * 60 * 1000;
+// Public installed-app OAuth client used by Antigravity / agy (same id PokeTokenBar
+// and the agy binary embed). Not confidential — installed-app clients cannot keep a
+// secret. Used to refresh the on-disk Google token so quota can be read like
+// Claude/Codex without the IDE process running.
+const ANTIGRAVITY_OAUTH_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+const ANTIGRAVITY_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token";
+const ANTIGRAVITY_LOAD_CODE_ASSIST_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+// The daily- host is what the Antigravity app uses. The unprefixed host often
+// returns remainingFraction=1 for Gemini buckets (looks like 100% free).
+const ANTIGRAVITY_QUOTA_SUMMARY_URLS = Object.freeze([
+  "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+  "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+]);
+const ANTIGRAVITY_USER_AGENT = "antigravity/2.9.1";
+const ANTIGRAVITY_TOKEN_REFRESH_SKEW_MS = 60 * 1000;
+const ANTIGRAVITY_AUTH_EXPIRED_MESSAGE = "Not logged in to Antigravity. Launch Antigravity once to authenticate.";
+const ANTIGRAVITY_NOT_RUNNING_MESSAGE = "Antigravity IDE is not running. Launch Antigravity to see usage limits.";
 // Claude shares its OAuth usage endpoint budget with Claude Code itself, so a transient
 // 429 is common. Persist the last successful read so the panel can keep showing it instead
 // of flashing a red error. Separate file from Antigravity's (whose writer rewrites the whole
@@ -2838,11 +2855,17 @@ function normalizeAntigravityResponse(body, { fallbackToConfigs = false } = {}) 
 }
 
 function normalizeAntigravityQuotaSummary(body) {
-  if (!antigravityCodeIsOk(body?.code)) {
+  if (body?.code !== undefined && body?.code !== null && !antigravityCodeIsOk(body.code)) {
     throw new Error(`Antigravity API error: ${body?.code}`);
   }
 
-  const groups = body?.response?.groups;
+  // Local Connect-RPC wraps the payload in `response`; the Cloud Code HTTP
+  // endpoint returns `groups` at the top level.
+  const groups = Array.isArray(body?.response?.groups)
+    ? body.response.groups
+    : Array.isArray(body?.groups)
+      ? body.groups
+      : null;
   if (!Array.isArray(groups) || !groups.length) {
     throw new Error("Could not parse Antigravity quota summary: no groups.");
   }
@@ -2850,7 +2873,10 @@ function normalizeAntigravityQuotaSummary(body) {
   // Map bucketId → window, regardless of which group they live in
   const makeWindow = (remainingFraction, resetTime) => {
     if (typeof remainingFraction !== "number") return null;
-    return buildWindow({ usedPercent: 100 - remainingFraction * 100, resetAt: resetTime || null });
+    return buildWindow({
+      usedPercent: Math.round((1 - remainingFraction) * 100),
+      resetAt: parseAntigravityDate(resetTime) || (typeof resetTime === "string" ? resetTime : null),
+    });
   };
 
   // Collect all buckets into a flat bucketId-keyed map
@@ -2913,7 +2939,312 @@ function hasAntigravityInstallEvidence({ home } = {}) {
     });
 }
 
-async function fetchAntigravityLimits({ home, commandRunner, requestFn, fetchImpl = fetch, timeoutMs = 8000, nowMs = Date.now(), platform = process.platform } = {}) {
+function listAntigravityCredentialPaths(home) {
+  const geminiHome = path.join(home || os.homedir(), ".gemini");
+  return [
+    path.join(geminiHome, "jetski-standalone-oauth-token"),
+    path.join(geminiHome, "antigravity", "jetski-standalone-oauth-token"),
+    path.join(geminiHome, "antigravity", "antigravity-oauth-token"),
+    path.join(geminiHome, "antigravity-ide", "antigravity-oauth-token"),
+    path.join(geminiHome, "antigravity-cli", "antigravity-oauth-token"),
+  ];
+}
+
+function parseAntigravityExpiryMs(value) {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return value < 1e12 ? value * 1000 : value;
+  }
+  if (typeof value === "string" && value) {
+    const ms = Date.parse(value);
+    if (Number.isFinite(ms) && ms > 0) return ms;
+  }
+  return null;
+}
+
+function parseAntigravityCredentialPayload(raw) {
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  let text = raw.trim();
+  if (text.startsWith("go-keyring-base64:")) {
+    try {
+      text = Buffer.from(text.slice("go-keyring-base64:".length), "base64").toString("utf8").trim();
+    } catch {
+      return null;
+    }
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+
+  const tokenObj = parsed.token && typeof parsed.token === "object" && !Array.isArray(parsed.token)
+    ? parsed.token
+    : parsed;
+  const accessToken = typeof tokenObj.access_token === "string" && tokenObj.access_token
+    ? tokenObj.access_token
+    : (typeof parsed.token === "string" && parsed.token ? parsed.token : null);
+  if (!accessToken) return null;
+  const refreshToken = typeof tokenObj.refresh_token === "string" && tokenObj.refresh_token
+    ? tokenObj.refresh_token
+    : (typeof parsed.refresh_token === "string" && parsed.refresh_token ? parsed.refresh_token : null);
+  return {
+    accessToken,
+    refreshToken,
+    expiryMs: parseAntigravityExpiryMs(
+      tokenObj.expiry ?? tokenObj.expiry_date ?? parsed.expiry ?? parsed.expiry_date,
+    ),
+    raw: parsed,
+  };
+}
+
+function loadAntigravityCredentialsFromFiles({ home } = {}) {
+  for (const credPath of listAntigravityCredentialPaths(home)) {
+    try {
+      const parsed = parseAntigravityCredentialPayload(fs.readFileSync(credPath, "utf8"));
+      if (parsed) {
+        return { ...parsed, source: "file", path: credPath };
+      }
+    } catch {
+      // missing or unreadable
+    }
+  }
+  return null;
+}
+
+function readAntigravityKeychainRaw({ securityRunner, timeoutMs = 2000 } = {}) {
+  const runner = typeof securityRunner === "function" ? securityRunner : cp.spawnSync;
+  if (runner === cp.spawnSync) {
+    if (process.platform !== "darwin" || !fs.existsSync(MACOS_SECURITY_BIN)) return null;
+  }
+  try {
+    const result = runner(
+      MACOS_SECURITY_BIN,
+      ["find-generic-password", "-s", "gemini", "-a", "antigravity", "-w"],
+      {
+        encoding: "utf8",
+        timeout: timeoutMs,
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    );
+    if (!result || result.error || result.status !== 0) return null;
+    const stdout = typeof result.stdout === "string"
+      ? result.stdout
+      : Buffer.isBuffer(result.stdout)
+        ? result.stdout.toString("utf8")
+        : "";
+    const trimmed = stdout.trim();
+    return trimmed || null;
+  } catch {
+    return null;
+  }
+}
+
+function loadAntigravityCredentials({ home, platform = process.platform, securityRunner } = {}) {
+  const fromFile = loadAntigravityCredentialsFromFiles({ home });
+  if (fromFile) return fromFile;
+  if (platform !== "darwin" && typeof securityRunner !== "function") return null;
+  const raw = readAntigravityKeychainRaw({ securityRunner });
+  const parsed = parseAntigravityCredentialPayload(raw);
+  if (!parsed) return null;
+  return { ...parsed, source: "keychain", path: null };
+}
+
+function persistAntigravityCredentials(creds, next, { nowMs = Date.now() } = {}) {
+  if (creds?.source !== "file" || !creds.path) return;
+  const expiresIn = Number.isFinite(next?.expiresIn) && next.expiresIn > 0 ? next.expiresIn : 3600;
+  const expiry = new Date(nowMs + expiresIn * 1000).toISOString();
+  try {
+    const payload = creds.raw && typeof creds.raw === "object" ? { ...creds.raw } : {};
+    if (payload.token && typeof payload.token === "object") {
+      payload.token = {
+        ...payload.token,
+        access_token: next.accessToken,
+        expiry,
+      };
+      if (next.refreshToken) payload.token.refresh_token = next.refreshToken;
+    } else {
+      payload.access_token = next.accessToken;
+      payload.expiry = expiry;
+      if (next.refreshToken) payload.refresh_token = next.refreshToken;
+    }
+    const tmpPath = `${creds.path}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2), { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(tmpPath, creds.path);
+  } catch (_error) {}
+}
+
+async function refreshAntigravityAccessToken(refreshToken, { fetchImpl = fetch } = {}) {
+  if (typeof refreshToken !== "string" || !refreshToken) {
+    const err = new Error(ANTIGRAVITY_AUTH_EXPIRED_MESSAGE);
+    err.code = "AUTH_EXPIRED";
+    throw err;
+  }
+  const res = await fetchImpl(ANTIGRAVITY_OAUTH_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json",
+    },
+    body: new URLSearchParams({
+      client_id: ANTIGRAVITY_OAUTH_CLIENT_ID,
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+    }),
+  });
+  if (!res.ok) {
+    const err = new Error(ANTIGRAVITY_AUTH_EXPIRED_MESSAGE);
+    err.code = "AUTH_EXPIRED";
+    throw err;
+  }
+  const json = await res.json();
+  if (typeof json?.access_token !== "string" || !json.access_token) {
+    throw new Error("Could not parse Antigravity token refresh response");
+  }
+  return {
+    accessToken: json.access_token,
+    refreshToken: typeof json.refresh_token === "string" && json.refresh_token
+      ? json.refresh_token
+      : refreshToken,
+    expiresIn: Number(json.expires_in),
+  };
+}
+
+async function resolveAntigravityAccessToken(creds, { fetchImpl = fetch, nowMs = Date.now(), forceRefresh = false } = {}) {
+  const expired = creds.expiryMs != null && creds.expiryMs <= nowMs + ANTIGRAVITY_TOKEN_REFRESH_SKEW_MS;
+  if ((forceRefresh || expired || !creds.accessToken) && creds.refreshToken) {
+    const next = await refreshAntigravityAccessToken(creds.refreshToken, { fetchImpl });
+    persistAntigravityCredentials(creds, next, { nowMs });
+    return next.accessToken;
+  }
+  if (!creds.accessToken) {
+    const err = new Error(ANTIGRAVITY_AUTH_EXPIRED_MESSAGE);
+    err.code = "AUTH_EXPIRED";
+    throw err;
+  }
+  return creds.accessToken;
+}
+
+function postAntigravityCloudCode(fetchImpl, url, accessToken, body) {
+  return fetchImpl(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "User-Agent": ANTIGRAVITY_USER_AGENT,
+    },
+    body: JSON.stringify(body ?? {}),
+  });
+}
+
+async function fetchAntigravityQuotaSummaryJson(fetchImpl, accessToken) {
+  let lastError = null;
+  for (const url of ANTIGRAVITY_QUOTA_SUMMARY_URLS) {
+    try {
+      const res = await postAntigravityCloudCode(fetchImpl, url, accessToken, {});
+      if (res.status === 401 || res.status === 403) {
+        const err = new Error(ANTIGRAVITY_AUTH_EXPIRED_MESSAGE);
+        err.code = "AUTH_EXPIRED";
+        err.status = res.status;
+        throw err;
+      }
+      if (!res.ok) {
+        lastError = new Error(`Antigravity API error: HTTP ${res.status}`);
+        continue;
+      }
+      return await res.json();
+    } catch (error) {
+      if (error?.code === "AUTH_EXPIRED") throw error;
+      lastError = error;
+    }
+  }
+  throw lastError || new Error("Antigravity quota request failed.");
+}
+
+async function fetchAntigravityPlanLabel(fetchImpl, accessToken) {
+  try {
+    const res = await postAntigravityCloudCode(fetchImpl, ANTIGRAVITY_LOAD_CODE_ASSIST_URL, accessToken, {
+      metadata: { ideType: "ANTIGRAVITY" },
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const paid = json?.paidTier;
+    if (typeof paid?.name === "string" && paid.name.trim()) return paid.name.trim();
+    if (typeof paid?.id === "string" && paid.id.trim()) return paid.id.trim();
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchAntigravityRemoteLimits({
+  home,
+  platform = process.platform,
+  securityRunner,
+  fetchImpl = fetch,
+  nowMs = Date.now(),
+} = {}) {
+  const creds = loadAntigravityCredentials({ home, platform, securityRunner });
+  if (!creds) return null;
+
+  const loadWithToken = async (accessToken) => {
+    const payload = await fetchAntigravityQuotaSummaryJson(fetchImpl, accessToken);
+    const windows = normalizeAntigravityQuotaSummary(payload);
+    const accountPlan = windows.account_plan || await fetchAntigravityPlanLabel(fetchImpl, accessToken);
+    return {
+      configured: true,
+      error: null,
+      account_email: windows.account_email || null,
+      account_plan: accountPlan || null,
+      primary_window: windows.primary_window,
+      secondary_window: windows.secondary_window,
+      tertiary_window: windows.tertiary_window,
+      quaternary_window: windows.quaternary_window,
+    };
+  };
+
+  let accessToken = await resolveAntigravityAccessToken(creds, { fetchImpl, nowMs });
+  try {
+    return await loadWithToken(accessToken);
+  } catch (error) {
+    if (error?.code !== "AUTH_EXPIRED" || !creds.refreshToken) throw error;
+    accessToken = await resolveAntigravityAccessToken(creds, { fetchImpl, nowMs, forceRefresh: true });
+    return await loadWithToken(accessToken);
+  }
+}
+
+function antigravityUnavailableResult({ home, nowMs, platform, securityRunner, remoteError } = {}) {
+  const cached = readAntigravityLimitsCache({ home, nowMs });
+  if (cached) return cached;
+  const creds = loadAntigravityCredentials({ home, platform, securityRunner });
+  if (!hasAntigravityInstallEvidence({ home }) && !creds) {
+    return { configured: false };
+  }
+  if (remoteError) {
+    const raw = remoteError.message || "Unknown error";
+    const message = raw === "timeout" || /timed out/i.test(raw)
+      ? "Antigravity quota request timed out."
+      : raw;
+    return { configured: true, error: message };
+  }
+  if (creds) {
+    return { configured: true, error: ANTIGRAVITY_AUTH_EXPIRED_MESSAGE };
+  }
+  return { configured: true, error: ANTIGRAVITY_NOT_RUNNING_MESSAGE };
+}
+
+async function fetchAntigravityLimits({
+  home,
+  commandRunner,
+  requestFn,
+  fetchImpl = fetch,
+  timeoutMs = 8000,
+  nowMs = Date.now(),
+  platform = process.platform,
+  securityRunner,
+} = {}) {
   const finalize = (payload, normalizeOptions) => {
     const result = {
       configured: true,
@@ -2934,17 +3265,25 @@ async function fetchAntigravityLimits({ home, commandRunner, requestFn, fetchImp
     return result;
   };
 
+  let remoteError = null;
+  try {
+    const remote = await withProviderTimeout(
+      fetchAntigravityRemoteLimits({ home, platform, securityRunner, fetchImpl, nowMs }),
+      "Antigravity",
+      timeoutMs,
+    );
+    if (remote?.configured && !remote.error && hasAntigravityWindow(remote)) {
+      writeAntigravityLimitsCache(remote, { home, nowMs });
+      return remote;
+    }
+  } catch (error) {
+    remoteError = error;
+  }
+
   try {
     const processInfo = await detectAntigravityProcess({ commandRunner, platform });
     if (!processInfo.configured) {
-      const cached = readAntigravityLimitsCache({ home, nowMs });
-      if (cached) return cached;
-      // No install evidence → user likely doesn't have Antigravity at all.
-      // Return configured:false so the card stays neutral (like other providers).
-      if (!hasAntigravityInstallEvidence({ home })) {
-        return { configured: false };
-      }
-      return { configured: true, error: "Antigravity IDE is not running. Launch Antigravity to see usage limits." };
+      return antigravityUnavailableResult({ home, nowMs, platform, securityRunner, remoteError });
     }
     if (processInfo.error) {
       return { configured: true, error: processInfo.error };
@@ -3017,20 +3356,13 @@ async function fetchAntigravityLimits({ home, commandRunner, requestFn, fetchImp
       return finalize(modelConfigs, { fallbackToConfigs: true });
     }
   } catch (error) {
-    const cached = readAntigravityLimitsCache({ home, nowMs });
-    if (cached) return cached;
-    // If there's no install evidence, this error is likely from a system that
-    // never had Antigravity — return neutral state like other providers.
-    if (!hasAntigravityInstallEvidence({ home })) {
-      return { configured: false };
-    }
-    const message = error?.message === "timeout"
-      ? "Antigravity quota request timed out."
-      : error?.message || "Unknown error";
-    return {
-      configured: true,
-      error: message,
-    };
+    return antigravityUnavailableResult({
+      home,
+      nowMs,
+      platform,
+      securityRunner,
+      remoteError: remoteError || error,
+    });
   }
 }
 
@@ -3210,7 +3542,16 @@ async function fetchUsageLimitsUncached({
     withProviderTimeout(fetchGeminiLimits({ home, env, fetchImpl: providerFetch, commandRunner }), "Gemini", providerTimeoutMs)
       .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
     fetchKiroLimits({ commandRunner, now, platform, home }),
-    fetchAntigravityLimits({ home, commandRunner, requestFn, fetchImpl: providerFetch, nowMs }),
+    fetchAntigravityLimits({
+      home,
+      commandRunner,
+      requestFn,
+      fetchImpl: providerFetch,
+      nowMs,
+      platform,
+      securityRunner,
+      timeoutMs: providerTimeoutMs,
+    }),
     withProviderTimeout(fetchCopilotLimits({ home, env, fetchImpl: providerFetch, platform, securityRunner }), "GitHub Copilot", providerTimeoutMs)
       .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
     withProviderTimeout(fetchGrokLimits({ home, env, fetchImpl: providerFetch }), "Grok Build", providerTimeoutMs)
@@ -3501,6 +3842,8 @@ module.exports = {
   readKiroCreditsSummary,
   fetchKiroLimits,
   normalizeAntigravityResponse,
+  normalizeAntigravityQuotaSummary,
+  loadAntigravityCredentials,
   parseListeningPorts,
   parseWindowsListeningPorts,
   listAntigravityPorts,

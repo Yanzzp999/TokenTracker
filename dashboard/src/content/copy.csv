@@ -798,8 +798,8 @@ limits.label.antigravity_gemini_weekly,ui,LimitsPage,UsageLimitsPanel,antigravit
 limits.label.antigravity_gemini_5h,ui,LimitsPage,UsageLimitsPanel,antigravity_gemini_5h,"Gm 5h",,active
 limits.label.antigravity_live,ui,LimitsPage,UsageLimitsPanel,antigravity_live,"live",,active
 limits.label.antigravity_cached,ui,LimitsPage,UsageLimitsPanel,antigravity_cached,"cached",,active
-limits.tooltip.antigravity_live,ui,LimitsPage,UsageLimitsPanel,antigravity_live_tooltip,"Real-time limits retrieved directly from the running Antigravity process.",,active
-limits.tooltip.antigravity_cached,ui,LimitsPage,UsageLimitsPanel,antigravity_cached_tooltip,"Cached limits. Run Antigravity IDE/CLI to refresh.",,active
+limits.tooltip.antigravity_live,ui,LimitsPage,UsageLimitsPanel,antigravity_live_tooltip,"Real-time limits retrieved from your Antigravity Google account.",,active
+limits.tooltip.antigravity_cached,ui,LimitsPage,UsageLimitsPanel,antigravity_cached_tooltip,"Cached limits. Refreshes from your Antigravity login; the app does not need to be open.",,active
 limits.tooltip.qoder_cached,ui,LimitsPage,UsageLimitsPanel,qoder_cached_tooltip,"Cached limits. Run Qoder to refresh.",,active
 limits.bar.sub_one_percent,ui,LimitsPage,UsageLimitsPanel,bar_sub_one_percent,"<1",,active
 limits.status.not_connected,ui,LimitsPage,UsageLimitsPanel,status_not_connected,"Not connected",,active
