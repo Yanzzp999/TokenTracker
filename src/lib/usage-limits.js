@@ -70,6 +70,21 @@ const ANTIGRAVITY_QUOTA_SUMMARY_URLS = Object.freeze([
 ]);
 const ANTIGRAVITY_USER_AGENT = "antigravity/2.9.1";
 const ANTIGRAVITY_TOKEN_REFRESH_SKEW_MS = 60 * 1000;
+// Per-step ceilings for the Antigravity serial chain. `providerTimeoutMs` bounds the
+// whole chain (see fetchAntigravityLimits); these only cap a single step, so one slow
+// call cannot spend a budget that later steps — and the cache fallback — still need.
+// Every step's effective timeout is min(ceiling, remaining budget − guard).
+const ANTIGRAVITY_REMOTE_TIMEOUT_MS = 8000;
+const ANTIGRAVITY_PROCESS_SCAN_TIMEOUT_MS = 4000;
+const ANTIGRAVITY_LOCAL_REQUEST_TIMEOUT_MS = 8000;
+// Reserved tail of the provider budget. Without it the chain can consume the budget
+// right up to the outer race, leaving no time for readAntigravityLimitsCache — the
+// user would get a red error instead of the stale-but-usable bars the cache exists for.
+// Proportional with an absolute cap: a flat reserve larger than the whole budget would
+// skip every step and guarantee the error it exists to prevent.
+const ANTIGRAVITY_BUDGET_GUARD_MS = 1500;
+const ANTIGRAVITY_BUDGET_GUARD_FRACTION = 0.15;
+const ANTIGRAVITY_BUDGET_EXHAUSTED_MESSAGE = "Antigravity quota lookup timed out.";
 const ANTIGRAVITY_AUTH_EXPIRED_MESSAGE = "Not logged in to Antigravity. Launch Antigravity once to authenticate.";
 const ANTIGRAVITY_NOT_RUNNING_MESSAGE = "Antigravity IDE is not running. Launch Antigravity to see usage limits.";
 // Claude shares its OAuth usage endpoint budget with Claude Code itself, so a transient
@@ -2130,7 +2145,12 @@ function parseWindowsProcesses(output) {
     .filter((entry) => Number.isFinite(entry.pid) && entry.command);
 }
 
-async function detectAntigravityProcess({ commandRunner, platform = process.platform } = {}) {
+async function detectAntigravityProcess({
+  commandRunner,
+  platform = process.platform,
+  timeoutMs = ANTIGRAVITY_PROCESS_SCAN_TIMEOUT_MS,
+  signal,
+} = {}) {
   let processes;
   if (platform === "win32") {
     const script = [
@@ -2142,12 +2162,13 @@ async function detectAntigravityProcess({ commandRunner, platform = process.plat
       commandRunner,
       "powershell.exe",
       ["-NoProfile", "-NonInteractive", "-Command", script],
-      { timeout: 4000 },
+      { timeout: timeoutMs, signal },
     );
     processes = parseWindowsProcesses(result?.stdout);
   } else {
     const result = await runCommand(commandRunner, "/bin/ps", ["-ax", "-o", "pid=,command="], {
-      timeout: 4000,
+      timeout: timeoutMs,
+      signal,
     });
     processes = String(result?.stdout || "")
       .split("\n")
@@ -2611,13 +2632,18 @@ function parseWindowsListeningPorts(output, pid) {
   return Array.from(ports).sort((a, b) => a - b);
 }
 
-async function listAntigravityPorts(pid, { commandRunner, platform = process.platform } = {}) {
+async function listAntigravityPorts(pid, {
+  commandRunner,
+  platform = process.platform,
+  timeoutMs = ANTIGRAVITY_PROCESS_SCAN_TIMEOUT_MS,
+  signal,
+} = {}) {
   if (platform === "win32") {
     const result = await runCommand(
       commandRunner,
       "netstat.exe",
       ["-ano", "-p", "tcp"],
-      { timeout: 4000 },
+      { timeout: timeoutMs, signal },
     );
     const ports = parseWindowsListeningPorts(result?.stdout, pid);
     if (!ports.length) {
@@ -2633,7 +2659,7 @@ async function listAntigravityPorts(pid, { commandRunner, platform = process.pla
     commandRunner,
     lsof,
     ["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", String(pid)],
-    { timeout: 4000 },
+    { timeout: timeoutMs, signal },
   );
   const ports = parseListeningPorts(result?.stdout);
   if (!ports.length) {
@@ -2677,11 +2703,12 @@ function requestLocalJson({
   path,
   body,
   csrfToken,
-  timeoutMs = 8000,
+  timeoutMs = ANTIGRAVITY_LOCAL_REQUEST_TIMEOUT_MS,
   requestFn,
+  signal,
 }) {
   if (typeof requestFn === "function") {
-    return requestFn({ scheme, port, path, body, csrfToken, timeoutMs });
+    return requestFn({ scheme, port, path, body, csrfToken, timeoutMs, signal });
   }
 
   const client = scheme === "https" ? https : http;
@@ -2704,6 +2731,9 @@ function requestLocalJson({
         rejectUnauthorized: false,
         timeout: timeoutMs,
         headers,
+        // Without this the provider race only stops *waiting* — the socket stays
+        // open past the deadline. http.request aborts and emits 'error' instead.
+        signal,
       },
       (res) => {
         let data = "";
@@ -2910,7 +2940,7 @@ function normalizeAntigravityQuotaSummary(body) {
   };
 }
 
-async function probeAntigravityPort(port, csrfToken, { timeoutMs, requestFn, scheme = "https" } = {}) {
+async function probeAntigravityPort(port, csrfToken, { timeoutMs, requestFn, scheme = "https", signal } = {}) {
   try {
     await requestLocalJson({
       scheme,
@@ -2920,6 +2950,7 @@ async function probeAntigravityPort(port, csrfToken, { timeoutMs, requestFn, sch
       csrfToken,
       timeoutMs,
       requestFn,
+      signal,
     });
     return true;
   } catch (_error) {
@@ -3075,7 +3106,7 @@ function persistAntigravityCredentials(creds, next, { nowMs = Date.now() } = {})
   } catch (_error) {}
 }
 
-async function refreshAntigravityAccessToken(refreshToken, { fetchImpl = fetch } = {}) {
+async function refreshAntigravityAccessToken(refreshToken, { fetchImpl = fetch, signal } = {}) {
   if (typeof refreshToken !== "string" || !refreshToken) {
     const err = new Error(ANTIGRAVITY_AUTH_EXPIRED_MESSAGE);
     err.code = "AUTH_EXPIRED";
@@ -3092,6 +3123,7 @@ async function refreshAntigravityAccessToken(refreshToken, { fetchImpl = fetch }
       grant_type: "refresh_token",
       refresh_token: refreshToken,
     }),
+    signal,
   });
   if (!res.ok) {
     const err = new Error(ANTIGRAVITY_AUTH_EXPIRED_MESSAGE);
@@ -3111,10 +3143,10 @@ async function refreshAntigravityAccessToken(refreshToken, { fetchImpl = fetch }
   };
 }
 
-async function resolveAntigravityAccessToken(creds, { fetchImpl = fetch, nowMs = Date.now(), forceRefresh = false } = {}) {
+async function resolveAntigravityAccessToken(creds, { fetchImpl = fetch, nowMs = Date.now(), forceRefresh = false, signal } = {}) {
   const expired = creds.expiryMs != null && creds.expiryMs <= nowMs + ANTIGRAVITY_TOKEN_REFRESH_SKEW_MS;
   if ((forceRefresh || expired || !creds.accessToken) && creds.refreshToken) {
-    const next = await refreshAntigravityAccessToken(creds.refreshToken, { fetchImpl });
+    const next = await refreshAntigravityAccessToken(creds.refreshToken, { fetchImpl, signal });
     persistAntigravityCredentials(creds, next, { nowMs });
     return next.accessToken;
   }
@@ -3126,7 +3158,7 @@ async function resolveAntigravityAccessToken(creds, { fetchImpl = fetch, nowMs =
   return creds.accessToken;
 }
 
-function postAntigravityCloudCode(fetchImpl, url, accessToken, body) {
+function postAntigravityCloudCode(fetchImpl, url, accessToken, body, signal) {
   return fetchImpl(url, {
     method: "POST",
     headers: {
@@ -3136,14 +3168,15 @@ function postAntigravityCloudCode(fetchImpl, url, accessToken, body) {
       "User-Agent": ANTIGRAVITY_USER_AGENT,
     },
     body: JSON.stringify(body ?? {}),
+    signal,
   });
 }
 
-async function fetchAntigravityQuotaSummaryJson(fetchImpl, accessToken) {
+async function fetchAntigravityQuotaSummaryJson(fetchImpl, accessToken, signal) {
   let lastError = null;
   for (const url of ANTIGRAVITY_QUOTA_SUMMARY_URLS) {
     try {
-      const res = await postAntigravityCloudCode(fetchImpl, url, accessToken, {});
+      const res = await postAntigravityCloudCode(fetchImpl, url, accessToken, {}, signal);
       if (res.status === 401 || res.status === 403) {
         const err = new Error(ANTIGRAVITY_AUTH_EXPIRED_MESSAGE);
         err.code = "AUTH_EXPIRED";
@@ -3163,11 +3196,11 @@ async function fetchAntigravityQuotaSummaryJson(fetchImpl, accessToken) {
   throw lastError || new Error("Antigravity quota request failed.");
 }
 
-async function fetchAntigravityPlanLabel(fetchImpl, accessToken) {
+async function fetchAntigravityPlanLabel(fetchImpl, accessToken, signal) {
   try {
     const res = await postAntigravityCloudCode(fetchImpl, ANTIGRAVITY_LOAD_CODE_ASSIST_URL, accessToken, {
       metadata: { ideType: "ANTIGRAVITY" },
-    });
+    }, signal);
     if (!res.ok) return null;
     const json = await res.json();
     const paid = json?.paidTier;
@@ -3185,14 +3218,15 @@ async function fetchAntigravityRemoteLimits({
   securityRunner,
   fetchImpl = fetch,
   nowMs = Date.now(),
+  signal,
 } = {}) {
   const creds = loadAntigravityCredentials({ home, platform, securityRunner });
   if (!creds) return null;
 
   const loadWithToken = async (accessToken) => {
-    const payload = await fetchAntigravityQuotaSummaryJson(fetchImpl, accessToken);
+    const payload = await fetchAntigravityQuotaSummaryJson(fetchImpl, accessToken, signal);
     const windows = normalizeAntigravityQuotaSummary(payload);
-    const accountPlan = windows.account_plan || await fetchAntigravityPlanLabel(fetchImpl, accessToken);
+    const accountPlan = windows.account_plan || await fetchAntigravityPlanLabel(fetchImpl, accessToken, signal);
     return {
       configured: true,
       error: null,
@@ -3205,12 +3239,12 @@ async function fetchAntigravityRemoteLimits({
     };
   };
 
-  let accessToken = await resolveAntigravityAccessToken(creds, { fetchImpl, nowMs });
+  let accessToken = await resolveAntigravityAccessToken(creds, { fetchImpl, nowMs, signal });
   try {
     return await loadWithToken(accessToken);
   } catch (error) {
     if (error?.code !== "AUTH_EXPIRED" || !creds.refreshToken) throw error;
-    accessToken = await resolveAntigravityAccessToken(creds, { fetchImpl, nowMs, forceRefresh: true });
+    accessToken = await resolveAntigravityAccessToken(creds, { fetchImpl, nowMs, forceRefresh: true, signal });
     return await loadWithToken(accessToken);
   }
 }
@@ -3235,16 +3269,44 @@ function antigravityUnavailableResult({ home, nowMs, platform, securityRunner, r
   return { configured: true, error: ANTIGRAVITY_NOT_RUNNING_MESSAGE };
 }
 
+/**
+ * `providerTimeoutMs` bounds the WHOLE serial chain — remote quota attempt, process
+ * scan, port scan, port probes and local RPCs — not any single call. Mirrors
+ * fetchArkCodingPlanLimits / the codex remaining-budget pattern: each step's timeout is
+ * clamped to what is left of the budget, and a step whose share has run out is skipped
+ * rather than issued, so the chain can never outrun the outer provider race and the
+ * disk-cache fallback still resolves inside it.
+ *
+ * Before this was budgeted, `timeoutMs` was used as a PER-CALL timeout while the call
+ * site passed it as a TOTAL budget: one 15s budget bought 15s remote + 4s ps + 4s lsof
+ * + 15s per probed port + 15s per local RPC (~83s for a single port).
+ */
 async function fetchAntigravityLimits({
   home,
   commandRunner,
   requestFn,
   fetchImpl = fetch,
-  timeoutMs = 8000,
+  providerTimeoutMs = DEFAULT_PROVIDER_TIMEOUT_MS,
   nowMs = Date.now(),
   platform = process.platform,
   securityRunner,
+  signal,
 } = {}) {
+  const startedAtMs = performance.now();
+  // min(this step's ceiling, budget left after reserving the fallback guard).
+  // 0 means "no time left" — the caller must skip the call, not issue it.
+  const budgetedTimeoutMs = (stepCeilingMs) => {
+    if (!Number.isFinite(providerTimeoutMs) || providerTimeoutMs <= 0) return stepCeilingMs;
+    const guardMs = Math.min(
+      ANTIGRAVITY_BUDGET_GUARD_MS,
+      providerTimeoutMs * ANTIGRAVITY_BUDGET_GUARD_FRACTION,
+    );
+    const remainingMs = providerTimeoutMs - (performance.now() - startedAtMs);
+    const guardedMs = Math.floor(remainingMs - guardMs);
+    if (guardedMs <= 0) return 0;
+    return Math.min(stepCeilingMs, guardedMs);
+  };
+
   const finalize = (payload, normalizeOptions) => {
     const result = {
       configured: true,
@@ -3266,39 +3328,66 @@ async function fetchAntigravityLimits({
   };
 
   let remoteError = null;
-  try {
-    const remote = await withProviderTimeout(
-      fetchAntigravityRemoteLimits({ home, platform, securityRunner, fetchImpl, nowMs }),
-      "Antigravity",
-      timeoutMs,
-    );
-    if (remote?.configured && !remote.error && hasAntigravityWindow(remote)) {
-      writeAntigravityLimitsCache(remote, { home, nowMs });
-      return remote;
+  const remoteTimeoutMs = budgetedTimeoutMs(ANTIGRAVITY_REMOTE_TIMEOUT_MS);
+  if (remoteTimeoutMs > 0) {
+    try {
+      const remote = await withProviderTimeout(
+        fetchAntigravityRemoteLimits({ home, platform, securityRunner, fetchImpl, nowMs, signal }),
+        "Antigravity",
+        remoteTimeoutMs,
+      );
+      if (remote?.configured && !remote.error && hasAntigravityWindow(remote)) {
+        writeAntigravityLimitsCache(remote, { home, nowMs });
+        return remote;
+      }
+    } catch (error) {
+      remoteError = error;
     }
-  } catch (error) {
-    remoteError = error;
   }
 
   try {
-    const processInfo = await detectAntigravityProcess({ commandRunner, platform });
+    const processScanTimeoutMs = budgetedTimeoutMs(ANTIGRAVITY_PROCESS_SCAN_TIMEOUT_MS);
+    if (processScanTimeoutMs <= 0) {
+      throw new Error(ANTIGRAVITY_BUDGET_EXHAUSTED_MESSAGE);
+    }
+    const processInfo = await detectAntigravityProcess({
+      commandRunner,
+      platform,
+      timeoutMs: processScanTimeoutMs,
+      signal,
+    });
     if (!processInfo.configured) {
       return antigravityUnavailableResult({ home, nowMs, platform, securityRunner, remoteError });
     }
     if (processInfo.error) {
       return { configured: true, error: processInfo.error };
     }
-    const ports = await listAntigravityPorts(processInfo.pid, { commandRunner, platform });
+    const portScanTimeoutMs = budgetedTimeoutMs(ANTIGRAVITY_PROCESS_SCAN_TIMEOUT_MS);
+    if (portScanTimeoutMs <= 0) {
+      throw new Error(ANTIGRAVITY_BUDGET_EXHAUSTED_MESSAGE);
+    }
+    const ports = await listAntigravityPorts(processInfo.pid, {
+      commandRunner,
+      platform,
+      timeoutMs: portScanTimeoutMs,
+      signal,
+    });
     let workingPort = null;
     let workingScheme = "https";
+    // Each probe draws from the same budget, so a long port list cannot multiply it:
+    // once the guard is reached the loop stops and the cache fallback runs instead.
     for (const port of ports) {
-      if (await probeAntigravityPort(port, processInfo.csrfToken, { timeoutMs, requestFn })) {
+      const probeTimeoutMs = budgetedTimeoutMs(ANTIGRAVITY_LOCAL_REQUEST_TIMEOUT_MS);
+      if (probeTimeoutMs <= 0) break;
+      if (await probeAntigravityPort(port, processInfo.csrfToken, { timeoutMs: probeTimeoutMs, requestFn, signal })) {
         workingPort = port;
         break;
       }
       // agy CLI serves both HTTPS and HTTP; no CSRF needed
       if (!processInfo.csrfToken) {
-        if (await probeAntigravityPort(port, null, { timeoutMs, requestFn, scheme: "http" })) {
+        const httpProbeTimeoutMs = budgetedTimeoutMs(ANTIGRAVITY_LOCAL_REQUEST_TIMEOUT_MS);
+        if (httpProbeTimeoutMs <= 0) break;
+        if (await probeAntigravityPort(port, null, { timeoutMs: httpProbeTimeoutMs, requestFn, scheme: "http", signal })) {
           workingPort = port;
           workingScheme = "http";
           break;
@@ -3309,21 +3398,29 @@ async function fetchAntigravityLimits({
       throw new Error("Antigravity port detection failed: no working API port found");
     }
 
-    try {
-      const quotaSummary = await requestLocalJson({
-        scheme: workingScheme,
-        port: workingPort,
-        path: "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary",
-        body: antigravityDefaultBody(),
-        csrfToken: processInfo.csrfToken,
-        timeoutMs,
-        requestFn,
-      });
-      return finalizeQuotaSummary(quotaSummary);
-    } catch (_quotaError) {
-      // quota summary not available (IDE servers return 404) → fall back to GetUserStatus
+    const quotaTimeoutMs = budgetedTimeoutMs(ANTIGRAVITY_LOCAL_REQUEST_TIMEOUT_MS);
+    if (quotaTimeoutMs > 0) {
+      try {
+        const quotaSummary = await requestLocalJson({
+          scheme: workingScheme,
+          port: workingPort,
+          path: "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary",
+          body: antigravityDefaultBody(),
+          csrfToken: processInfo.csrfToken,
+          timeoutMs: quotaTimeoutMs,
+          requestFn,
+          signal,
+        });
+        return finalizeQuotaSummary(quotaSummary);
+      } catch (_quotaError) {
+        // quota summary not available (IDE servers return 404) → fall back to GetUserStatus
+      }
     }
 
+    const userStatusTimeoutMs = budgetedTimeoutMs(ANTIGRAVITY_LOCAL_REQUEST_TIMEOUT_MS);
+    if (userStatusTimeoutMs <= 0) {
+      throw new Error(ANTIGRAVITY_BUDGET_EXHAUSTED_MESSAGE);
+    }
     try {
       const userStatus = await requestLocalJson({
         scheme: workingScheme,
@@ -3331,11 +3428,14 @@ async function fetchAntigravityLimits({
         path: "/exa.language_server_pb.LanguageServerService/GetUserStatus",
         body: antigravityDefaultBody(),
         csrfToken: processInfo.csrfToken,
-        timeoutMs,
+        timeoutMs: userStatusTimeoutMs,
         requestFn,
+        signal,
       });
       return finalize(userStatus);
     } catch (primaryError) {
+      const configsTimeoutMs = budgetedTimeoutMs(ANTIGRAVITY_LOCAL_REQUEST_TIMEOUT_MS);
+      if (configsTimeoutMs <= 0) throw primaryError;
       const fallbackPort =
         Number.isFinite(processInfo.extensionPort) && processInfo.extensionPort > 0
           ? processInfo.extensionPort
@@ -3350,8 +3450,9 @@ async function fetchAntigravityLimits({
         path: "/exa.language_server_pb.LanguageServerService/GetCommandModelConfigs",
         body: antigravityDefaultBody(),
         csrfToken: processInfo.csrfToken,
-        timeoutMs,
+        timeoutMs: configsTimeoutMs,
         requestFn,
+        signal,
       });
       return finalize(modelConfigs, { fallbackToConfigs: true });
     }
@@ -3542,16 +3643,24 @@ async function fetchUsageLimitsUncached({
     withProviderTimeout(fetchGeminiLimits({ home, env, fetchImpl: providerFetch, commandRunner }), "Gemini", providerTimeoutMs)
       .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
     fetchKiroLimits({ commandRunner, now, platform, home }),
-    fetchAntigravityLimits({
-      home,
-      commandRunner,
-      requestFn,
-      fetchImpl: providerFetch,
-      nowMs,
-      platform,
-      securityRunner,
-      timeoutMs: providerTimeoutMs,
-    }),
+    // Antigravity's own budget keeps the serial chain inside providerTimeoutMs; this
+    // outer race is the enforcing backstop every other provider already has, and the
+    // signal makes a fired race actually kill the spawned scans and open sockets.
+    withAbortableProviderTimeout(
+      (signal) => fetchAntigravityLimits({
+        home,
+        commandRunner,
+        requestFn,
+        fetchImpl: providerFetch,
+        nowMs,
+        platform,
+        securityRunner,
+        providerTimeoutMs,
+        signal,
+      }),
+      "Antigravity",
+      providerTimeoutMs,
+    ).catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
     withProviderTimeout(fetchCopilotLimits({ home, env, fetchImpl: providerFetch, platform, securityRunner }), "GitHub Copilot", providerTimeoutMs)
       .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
     withProviderTimeout(fetchGrokLimits({ home, env, fetchImpl: providerFetch }), "Grok Build", providerTimeoutMs)

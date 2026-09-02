@@ -292,7 +292,7 @@ describe("getUsageLimits antigravity cache", () => {
       assert.equal(result.antigravity.secondary_window.used_percent, 18);
       assert.equal(result.antigravity.tertiary_window.used_percent, 60);
       assert.equal(result.antigravity.quaternary_window.used_percent, 10);
-      assert.ok(fetchCalls.some((url) => url.includes("daily-cloudcode-pa.googleapis.com")));
+      assert.ok(fetchCalls.some((url) => urlHostMatches(url, "daily-cloudcode-pa.googleapis.com")));
     } finally {
       resetUsageLimitsCache();
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -3884,6 +3884,198 @@ describe("fetchAntigravityLimits remote OAuth", () => {
       const quotaCalls = calls.filter((url) => url.includes("retrieveUserQuotaSummary"));
       assert.equal(quotaCalls[0], "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary");
       assert.ok(!quotaCalls.includes("https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"));
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// The invariant these lock in: fetchAntigravityLimits spends ONE providerTimeoutMs
+// across its whole serial chain (remote quota attempt → ps → lsof → per-port probes →
+// local RPCs), not one per step. Before it was budgeted, a 15s provider budget bought
+// 15s remote + 4s ps + 4s lsof + 15s per probed port + 15s per local RPC, and
+// /functions/tokentracker-usage-limits has no outer timeout of its own to absorb that.
+describe("fetchAntigravityLimits provider budget", () => {
+  const PROVIDER_TIMEOUT_MS = 1000;
+  // Wall-clock slack for timer/event-loop jitter on a loaded CI runner. Deliberately
+  // far below a second full budget, so any regression that pays one per step still fails.
+  const TOLERANCE_MS = 400;
+
+  // Never settles — stands in for a Cloud Code host that accepts the connection and
+  // then goes quiet, which is the case that used to spend the budget twice.
+  const hangingFetch = () => new Promise(() => {});
+  const failingFetch = () => Promise.reject(new Error("network unreachable"));
+  // Mirrors requestLocalJson's real socket: rejects only when its own per-call timeout
+  // elapses, so an unbudgeted caller pays the full timeout once per call.
+  const hangingRequestFn = ({ timeoutMs }) => new Promise((_, reject) => {
+    setTimeout(() => reject(new Error("timeout")), timeoutMs);
+  });
+
+  function antigravityProcessCommandRunner(portCount) {
+    const portLines = Array.from(
+      { length: portCount },
+      (_, i) => `lang 123 me ${20 + i}u IPv4 0x1 0t0 TCP 127.0.0.1:${41000 + i} (LISTEN)`,
+    ).join("\n");
+    return (command) => {
+      if (command === "/bin/ps") {
+        return {
+          status: 0,
+          stdout: "123 /Applications/Antigravity.app/Contents/MacOS/language_server_macos --app_data_dir antigravity --csrf_token abc123\n",
+        };
+      }
+      if (command === "which") return { status: 0, stdout: "/usr/bin/lsof\n" };
+      if (String(command).endsWith("lsof")) return { status: 0, stdout: `${portLines}\n` };
+      return { status: 1, stdout: "", stderr: "" };
+    };
+  }
+
+  function writeAntigravityCache(tmp, nowMs) {
+    const trackerDir = path.join(tmp, ".tokentracker", "tracker");
+    fs.mkdirSync(trackerDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(trackerDir, "usage-limits-cache.json"),
+      JSON.stringify({
+        antigravity: {
+          primary_window: { used_percent: 71, reset_at: new Date(nowMs + 3600_000).toISOString() },
+          cached_at: new Date(nowMs).toISOString(),
+        },
+      }),
+      "utf8",
+    );
+  }
+
+  async function measure(run) {
+    const startedAtMs = Date.now();
+    const result = await run();
+    return { result, elapsedMs: Date.now() - startedAtMs };
+  }
+
+  function assertWithinBudget(elapsedMs, label) {
+    assert.ok(
+      elapsedMs <= PROVIDER_TIMEOUT_MS + TOLERANCE_MS,
+      `${label}: took ${elapsedMs}ms, budget ${PROVIDER_TIMEOUT_MS}ms (+${TOLERANCE_MS}ms tolerance)`,
+    );
+  }
+
+  // Port count is the multiplier that used to turn one budget into N: each probe
+  // previously got the full providerTimeoutMs of its own.
+  for (const portCount of [1, 3, 10]) {
+    it(`stays inside the budget when every local probe hangs (${portCount} listening ports)`, async () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-antigravity-budget-"));
+      try {
+        writeAntigravityOauthToken(tmp);
+        const { result, elapsedMs } = await measure(() => fetchAntigravityLimits({
+          home: tmp,
+          platform: "linux",
+          providerTimeoutMs: PROVIDER_TIMEOUT_MS,
+          commandRunner: antigravityProcessCommandRunner(portCount),
+          requestFn: hangingRequestFn,
+          fetchImpl: failingFetch,
+          securityRunner() { return { status: 1, stdout: "" }; },
+        }));
+        assertWithinBudget(elapsedMs, `${portCount} ports`);
+        assert.equal(result.configured, true);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("stays inside the budget when the remote attempt hangs and the IDE is running", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-antigravity-budget-remote-"));
+    try {
+      writeAntigravityOauthToken(tmp);
+      const { result, elapsedMs } = await measure(() => fetchAntigravityLimits({
+        home: tmp,
+        platform: "linux",
+        providerTimeoutMs: PROVIDER_TIMEOUT_MS,
+        commandRunner: antigravityProcessCommandRunner(3),
+        requestFn: hangingRequestFn,
+        fetchImpl: hangingFetch,
+        securityRunner() { return { status: 1, stdout: "" }; },
+      }));
+      assertWithinBudget(elapsedMs, "remote hang + local fallback");
+      assert.equal(result.configured, true);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("stays inside the budget when a probed port answers but the local RPCs hang", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-antigravity-budget-rpc-"));
+    try {
+      writeAntigravityOauthToken(tmp);
+      const requestFn = ({ path: requestPath, timeoutMs }) => {
+        if (requestPath.includes("GetUnleashData")) return Promise.resolve({ code: 0 });
+        return new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), timeoutMs));
+      };
+      const { result, elapsedMs } = await measure(() => fetchAntigravityLimits({
+        home: tmp,
+        platform: "linux",
+        providerTimeoutMs: PROVIDER_TIMEOUT_MS,
+        commandRunner: antigravityProcessCommandRunner(1),
+        requestFn,
+        fetchImpl: failingFetch,
+        securityRunner() { return { status: 1, stdout: "" }; },
+      }));
+      assertWithinBudget(elapsedMs, "probe ok + hanging RPCs");
+      assert.equal(result.configured, true);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // This is what the reserved guard buys. Without it the chain spends the budget right
+  // up to the deadline and the cache read never runs, so a user with perfectly good
+  // stale bars sees a red error instead.
+  it("still serves the disk cache when the remote attempt nearly exhausts the budget", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-antigravity-budget-guard-"));
+    try {
+      writeAntigravityOauthToken(tmp);
+      const nowMs = Date.now();
+      writeAntigravityCache(tmp, nowMs);
+      const { result, elapsedMs } = await measure(() => fetchAntigravityLimits({
+        home: tmp,
+        platform: "linux",
+        providerTimeoutMs: PROVIDER_TIMEOUT_MS,
+        nowMs,
+        commandRunner: antigravityProcessCommandRunner(3),
+        requestFn: hangingRequestFn,
+        fetchImpl: hangingFetch,
+        securityRunner() { return { status: 1, stdout: "" }; },
+      }));
+      assertWithinBudget(elapsedMs, "guard reserves cache time");
+      assert.equal(result.configured, true);
+      assert.equal(result.error, null);
+      assert.equal(result.cached, true);
+      assert.equal(result.primary_window.used_percent, 71);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("skips a step outright rather than issuing it with no budget left", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-antigravity-budget-skip-"));
+    try {
+      writeAntigravityOauthToken(tmp);
+      const localCalls = [];
+      const requestFn = ({ path: requestPath, timeoutMs }) => {
+        localCalls.push({ path: requestPath, timeoutMs });
+        return new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), timeoutMs));
+      };
+      await fetchAntigravityLimits({
+        home: tmp,
+        platform: "linux",
+        providerTimeoutMs: PROVIDER_TIMEOUT_MS,
+        commandRunner: antigravityProcessCommandRunner(10),
+        requestFn,
+        fetchImpl: failingFetch,
+        securityRunner() { return { status: 1, stdout: "" }; },
+      });
+      // 10 ports were advertised; the budget only ever funds the first probes, and
+      // every issued call carries a positive, shrinking timeout rather than the full one.
+      assert.ok(localCalls.length < 10, `issued ${localCalls.length} local calls for 10 ports`);
+      assert.ok(localCalls.every((call) => call.timeoutMs > 0 && call.timeoutMs <= PROVIDER_TIMEOUT_MS));
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
