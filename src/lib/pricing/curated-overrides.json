@@ -48,11 +48,11 @@
       "note": "Canonical undated alias emitted by Cursor. Pin to the same rates as claude-haiku-4-5-20251001 so local cost does not depend on which dated LiteLLM aliases are present in the current cache."
     },
     "gpt-5.6-sol": {
-      "input": 5,
-      "output": 30,
-      "cache_read": 0.5,
-      "cache_write": 6.25,
-      "note": "GPT-5.6 family (public 2026-07-09). Flagship tier. Not yet in LiteLLM. developers.openai.com/api/docs/pricing short-context: $5/$30 per MTok, cached input 0.1x, cache write 1.25x. Codex emits gpt-5.6-sol (+ reasoning-effort variants like gpt-5.6-solhigh, caught by fuzzy). Remove once LiteLLM carries it."
+      "input": 4,
+      "output": 20,
+      "cache_read": 0.4,
+      "cache_write": 5,
+      "note": "Official GPT-5.6 Sol standard pricing: $4 input, $0.40 cached input, $5 cache write, and $20 output per MTok. Requests above 272K input are repriced from their preserved per-request long-context subset. Codex emits gpt-5.6-sol plus reasoning-effort variants caught by fuzzy matching."
     },
     "gpt-5.6-terra": {
       "input": 2,
@@ -418,7 +418,7 @@
     },
     {
       "match": "gpt-5.6",
-      "ref": "gpt-5.6-terra"
+      "ref": "gpt-5.6-sol"
     },
     {
       "match": "kiro",

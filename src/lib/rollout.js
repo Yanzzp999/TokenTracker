@@ -15,6 +15,12 @@ const {
   createUsageDeltaState,
   snapshotUsageBaselines,
 } = require("./codex-token-usage");
+const {
+  applyCodexModelEvent,
+  createCodexModelAttributionState,
+  currentCodexModel,
+  snapshotCodexModelAttributionState,
+} = require("./codex-model-attribution");
 const { USD_TICKS_PER_USD, normalizeGrokUsage } = require("./grok-usage");
 
 const DEFAULT_SOURCE = "codex";
@@ -435,6 +441,9 @@ async function parseRolloutIncremental({
       ? prev.tokenUsageBaselines || null
       : null;
     const lastModel = sameInode && !truncated ? prev.lastModel || null : null;
+    const modelAttributionState = sameInode && !truncated
+      ? prev.modelAttributionState || null
+      : null;
 
     const codexProjectFastPath = projectEnabled && fileSource === DEFAULT_SOURCE;
     const projectOffset = sameInode && !truncated ? Number(prev.projectOffset || 0) : 0;
@@ -506,6 +515,7 @@ async function parseRolloutIncremental({
           lastTotal,
           tokenUsageBaselines,
           lastModel,
+          modelAttributionState,
           projectState,
           projectMetaCache,
           publicRepoCache,
@@ -520,6 +530,7 @@ async function parseRolloutIncremental({
           lastTotal,
           tokenUsageBaselines,
           lastModel,
+          modelAttributionState,
           hourlyState,
           touchedBuckets,
           source: fileSource,
@@ -542,6 +553,7 @@ async function parseRolloutIncremental({
       lastTotal: result.lastTotal,
       tokenUsageBaselines: result.tokenUsageBaselines,
       lastModel: result.lastModel,
+      modelAttributionState: result.modelAttributionState,
       updatedAt: new Date().toISOString(),
     };
     if (codexProjectFastPath) {
@@ -2017,6 +2029,7 @@ async function parseRolloutFile({
   lastTotal,
   tokenUsageBaselines,
   lastModel,
+  modelAttributionState: previousModelAttributionState,
   hourlyState,
   touchedBuckets,
   source,
@@ -2042,6 +2055,7 @@ async function parseRolloutFile({
       lastTotal,
       tokenUsageBaselines,
       lastModel,
+      modelAttributionState: previousModelAttributionState,
       eventsAggregated: 0,
       projectFileContexts,
     };
@@ -2053,6 +2067,9 @@ async function parseRolloutFile({
   });
 
   let model = typeof lastModel === "string" ? lastModel : null;
+  const modelAttributionState = createCodexModelAttributionState(
+    previousModelAttributionState || { model },
+  );
   const usageDeltaState = createUsageDeltaState({
     lastTotal,
     baselines: tokenUsageBaselines,
@@ -2090,14 +2107,17 @@ async function parseRolloutFile({
     const { line } = record;
     if (!line) continue;
     const maybeTokenCount = line.includes('"token_count"');
-    const maybeTurnContext =
+    const maybeModelReroute =
       !maybeTokenCount &&
+      (line.includes('"model/rerouted"') || line.includes('"model_rerouted"'));
+    const maybeTurnContext =
+      !maybeTokenCount && !maybeModelReroute &&
       (line.includes('"turn_context"') || line.includes('"session_meta"')) &&
       (line.includes('"model"') ||
         line.includes('"cwd"') ||
         line.includes('"current_date"') ||
         line.includes('"forked_from_id"'));
-    if (!maybeTokenCount && !maybeTurnContext) {
+    if (!maybeTokenCount && !maybeTurnContext && !maybeModelReroute) {
       if (invalidRecordPolicy === "throw" || !record.terminated) {
         try {
           JSON.parse(line);
@@ -2120,6 +2140,9 @@ async function parseRolloutFile({
     }
     if (!record.terminated) committedEndOffset = scannedEndOffset;
 
+    applyCodexModelEvent(modelAttributionState, obj);
+    model = currentCodexModel(modelAttributionState) || model;
+
     if (
       (obj?.type === "turn_context" || obj?.type === "session_meta") &&
       obj?.payload &&
@@ -2130,9 +2153,6 @@ async function parseRolloutFile({
       }
       if (obj.type === "turn_context" && typeof obj.payload.current_date === "string") {
         currentDate = normalizeIsoDate(obj.payload.current_date);
-      }
-      if (typeof obj.payload.model === "string") {
-        model = obj.payload.model;
       }
       if (projectState && typeof obj.payload.cwd === "string") {
         const nextCwd = obj.payload.cwd.trim();
@@ -2167,7 +2187,9 @@ async function parseRolloutFile({
     if (totalUsage && typeof totalUsage === "object") latestTotal = totalUsage;
 
     const rawDelta = consumeUsageDelta(usageDeltaState, lastUsage, totalUsage);
-    const delta = rawDelta ? normalizeUsage(rawDelta) : null;
+    const totalOnlyResetSentinel = source === DEFAULT_SOURCE
+      && isCodexTotalOnlyResetSentinel(lastUsage, totalUsage);
+    const delta = rawDelta && !totalOnlyResetSentinel ? normalizeUsage(rawDelta) : null;
     if (!delta || isAllZeroUsage(delta)) continue;
     delta.conversation_count = 1;
 
@@ -2266,6 +2288,7 @@ async function parseRolloutFile({
     lastTotal: latestTotal,
     tokenUsageBaselines: snapshotUsageBaselines(usageDeltaState),
     lastModel: model,
+    modelAttributionState: snapshotCodexModelAttributionState(modelAttributionState),
     eventsAggregated,
     projectFileContexts,
   };
@@ -2277,6 +2300,7 @@ async function scanRolloutProjectFileContexts({
   lastTotal,
   tokenUsageBaselines,
   lastModel,
+  modelAttributionState,
   projectState,
   projectMetaCache,
   publicRepoCache,
@@ -2294,6 +2318,7 @@ async function scanRolloutProjectFileContexts({
       lastTotal,
       tokenUsageBaselines,
       lastModel,
+      modelAttributionState,
       eventsAggregated: 0,
       projectFileContexts,
     };
@@ -2370,6 +2395,7 @@ async function scanRolloutProjectFileContexts({
     lastTotal,
     tokenUsageBaselines,
     lastModel,
+    modelAttributionState,
     eventsAggregated: 0,
     projectFileContexts,
   };
@@ -4389,11 +4415,26 @@ function normalizeUsage(u) {
   // bytes twice: once at the full input rate and again at the cache_read
   // rate, producing ~6–7x cost inflation on cache-heavy Codex sessions
   // (verified against ccusage's per-day numbers on the same rollouts).
-  // We intentionally leave `total_tokens` unchanged: Codex reports
-  // total = input(inclusive of cached) + output, which numerically equals
-  // our schema's non_cached + cached + output + 0 (cache_creation=0 here).
+  // Preserve the reported total for compatibility with older Codex / Every
+  // Code shapes where output_tokens can exclude reasoning or some component
+  // fields are absent. The exact all-zero reset sentinel is rejected before
+  // normalization by isCodexTotalOnlyResetSentinel().
   out.input_tokens = Math.max(0, out.input_tokens - out.cached_input_tokens);
   return out;
+}
+
+function isCodexTotalOnlyResetSentinel(lastUsage, totalUsage) {
+  const componentTotal = (usage) => [
+    usage?.input_tokens,
+    usage?.cached_input_tokens,
+    usage?.cache_creation_input_tokens ?? usage?.cache_write_input_tokens,
+    usage?.output_tokens,
+    usage?.reasoning_output_tokens,
+  ].reduce((sum, value) => sum + Math.max(0, Number(value) || 0), 0);
+  return Number(lastUsage?.total_tokens || 0) > 0
+    && Number(totalUsage?.total_tokens || 0) === 0
+    && componentTotal(lastUsage) === 0
+    && componentTotal(totalUsage) === 0;
 }
 
 // Stable dedup key for one Claude jsonl entry. Anthropic's official protocol

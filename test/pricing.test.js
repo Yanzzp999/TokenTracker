@@ -129,15 +129,15 @@ test("matcher: GPT-5.6 codex tiers resolve to their real curated rates (not the 
   // LiteLLM has no gpt-5.6 yet; simulate that so curated must win.
   const litellm = { "gpt-5": { input: 1.25, output: 10, cache_read: 0.125 } };
   const cases = [
-    ["gpt-5.6-sol", 5, 30, "curated:exact"],
+    ["gpt-5.6-sol", 4, 20, "curated:exact"],
     ["gpt-5.6-terra", 2, 12, "curated:exact"],
     ["gpt-5.6-luna", 0.2, 1.2, "curated:exact"],
     // reasoning-effort variants codex appends must still land on the right tier
-    ["gpt-5.6-sol-high", 5, 30, null],
-    ["gpt-5.6-solhigh", 5, 30, "curated:fuzzy"],
+    ["gpt-5.6-sol-high", 4, 20, null],
+    ["gpt-5.6-solhigh", 4, 20, "curated:fuzzy"],
     ["gpt-5.6-terrahigh", 2, 12, "curated:fuzzy"],
-    // bare / unknown-tier falls back to the balanced terra tier, never gpt-5
-    ["gpt-5.6", 2, 12, "curated:fuzzy"],
+    // The public bare alias resolves to Sol, never the older gpt-5 entry.
+    ["gpt-5.6", 4, 20, "curated:fuzzy"],
   ];
   for (const [model, input, output, source] of cases) {
     const r = matcher.lookupPricing(model, { curated, litellm, source: "codex" });
@@ -921,6 +921,34 @@ test("index: computeRowCost on Codex row does NOT double-count reasoning", async
     Math.abs(cost - expected) < 1e-9,
     `expected ${expected}, got ${cost}`,
   );
+});
+
+test("index: computeRowCost applies GPT-5.6 Sol long-context pricing to only the observed request subset", () => {
+  const row = {
+    source: "codex",
+    model: "gpt-5.6-sol-high",
+    input_tokens: 100_000,
+    cached_input_tokens: 200_000,
+    cache_creation_input_tokens: 10_000,
+    output_tokens: 20_000,
+    reasoning_output_tokens: 5_000,
+    long_context_input_tokens: 100_000,
+    long_context_cached_input_tokens: 200_000,
+    long_context_cache_creation_input_tokens: 10_000,
+    long_context_output_tokens: 20_000,
+    long_context_reasoning_output_tokens: 5_000,
+  };
+  // Standard: .4 + .08 + .05 + .4 = .93. Long-context premium:
+  // .4 + .08 + .05 + .2 = .73. Reasoning is already inside Codex output.
+  assert.ok(Math.abs(pricing.computeRowCost(row) - 1.66) < 1e-12);
+  assert.ok(Math.abs(pricing.computeRowCost({
+    ...row,
+    long_context_input_tokens: 0,
+    long_context_cached_input_tokens: 0,
+    long_context_cache_creation_input_tokens: 0,
+    long_context_output_tokens: 0,
+    long_context_reasoning_output_tokens: 0,
+  }) - 0.93) < 1e-12);
 });
 
 test("index: computeRowCost on non-Codex source DOES bill reasoning tokens", async () => {

@@ -142,10 +142,10 @@ const MODEL_PRICING: Record<string, { input: number; output: number; cache_read:
   "gpt-5.4-pro": { input: 30, output: 180, cache_read: 3 },
   "gpt-5.5": { input: 5, output: 30, cache_read: 0.5 },
   // GPT-5.6 family (public 2026-07-09), developers.openai.com/api/docs/pricing.
-  // Three durable capability tiers: sol (flagship) / terra (balanced default) /
+  // Three durable capability tiers: sol (flagship and public alias) / terra (balanced) /
   // luna (lightweight). Codex reports the tier in the model id (gpt-5.6-sol,
   // + reasoning-effort variants like gpt-5.6-solhigh). Not yet in LiteLLM.
-  "gpt-5.6-sol": { input: 5, output: 30, cache_read: 0.5, cache_write: 6.25 },
+  "gpt-5.6-sol": { input: 4, output: 20, cache_read: 0.4, cache_write: 5 },
   "gpt-5.6-terra": { input: 2, output: 12, cache_read: 0.2, cache_write: 2.5 },
   "gpt-5.6-luna": { input: 0.2, output: 1.2, cache_read: 0.02, cache_write: 0.25 },
   "gpt-5-mini": { input: 0.25, output: 2, cache_read: 0.025 },
@@ -277,11 +277,11 @@ function getModelPricing(model: string) {
   if (lower.includes("sonnet")) return MODEL_PRICING["claude-sonnet-4-6"];
   // gpt-5.6 tiers: sol/terra/luna carry reasoning-effort suffixes (solhigh,
   // etc.), so match by substring. Specific tiers precede the generic gpt-5.6
-  // fallback (which defaults to the balanced terra tier).
+  // fallback (the public gpt-5.6 alias points to the flagship sol tier).
   if (lower.includes("gpt-5.6-sol")) return MODEL_PRICING["gpt-5.6-sol"];
   if (lower.includes("gpt-5.6-terra")) return MODEL_PRICING["gpt-5.6-terra"];
   if (lower.includes("gpt-5.6-luna")) return MODEL_PRICING["gpt-5.6-luna"];
-  if (lower.includes("gpt-5.6")) return MODEL_PRICING["gpt-5.6-terra"];
+  if (lower.includes("gpt-5.6")) return MODEL_PRICING["gpt-5.6-sol"];
   if (lower.includes("gpt-5.4-pro")) return MODEL_PRICING["gpt-5.4-pro"];
   if (lower.includes("gpt-5.4")) return MODEL_PRICING["gpt-5.4"];
   if (lower.includes("gpt-5.5")) return MODEL_PRICING["gpt-5.5"];

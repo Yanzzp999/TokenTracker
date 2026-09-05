@@ -25,6 +25,11 @@ const PI_SUBSCRIPTION_SOURCES = new Set([
 // server (including LM Link). Secure Cloud usage has a separate billing path
 // and is not present in these logs.
 const LOCAL_INFERENCE_SOURCES = new Set(["lmstudio"]);
+// Forward-looking: unreachable for Codex today. Every observed token_count
+// reports model_context_window = 258400, below this threshold, so no request
+// can exceed it (max raw input seen locally: 238853). The long-context
+// repricing stays in place for when OpenAI ships a larger Codex window.
+const OPENAI_LONG_CONTEXT_INPUT_THRESHOLD = 272_000;
 const SOURCES_WITH_AUTHORITATIVE_COST = new Set(["grok"]);
 const SEED_SNAPSHOT_PATH = path.resolve(__dirname, "seed-snapshot.json");
 const DEEPSEEK_TIME_PRICED_MODELS = [
@@ -192,7 +197,7 @@ function computeRowCost(row) {
   const reasoningCost = reasoningIncludedInOutput
     ? 0
     : (row.reasoning_output_tokens || 0) * (pricing.output || 0);
-  return (
+  const baseCost = (
     ((row.input_tokens || 0) * (pricing.input || 0) +
       (row.output_tokens || 0) * (pricing.output || 0) +
       (row.cached_input_tokens || 0) * (pricing.cache_read || 0) +
@@ -200,6 +205,37 @@ function computeRowCost(row) {
       reasoningCost) /
     1_000_000
   );
+
+  const model = String(row?.model || "").toLowerCase();
+  const usesGpt56SolLongContextTier =
+    model === "gpt-5.6" || model.includes("gpt-5.6-sol");
+  if (!usesGpt56SolLongContextTier) return baseCost;
+
+  const bounded = (value, total) => Math.min(
+    Math.max(0, Number(value) || 0),
+    Math.max(0, Number(total) || 0),
+  );
+  // The parser records only usage from requests whose cache-inclusive input
+  // exceeded 272K. OpenAI prices the whole such request at 2x input and 1.5x
+  // output, so add the premium over the standard-rate base exactly once.
+  const longInput = bounded(row.long_context_input_tokens, row.input_tokens);
+  const longCached = bounded(row.long_context_cached_input_tokens, row.cached_input_tokens);
+  const longCacheWrite = bounded(
+    row.long_context_cache_creation_input_tokens,
+    row.cache_creation_input_tokens,
+  );
+  const longOutput = bounded(row.long_context_output_tokens, row.output_tokens);
+  const longReasoning = reasoningIncludedInOutput
+    ? 0
+    : bounded(row.long_context_reasoning_output_tokens, row.reasoning_output_tokens);
+  const longContextPremium = (
+    longInput * (pricing.input || 0) +
+    longCached * (pricing.cache_read || 0) +
+    longCacheWrite * (pricing.cache_write || 0) +
+    0.5 * longOutput * (pricing.output || 0) +
+    0.5 * longReasoning * (pricing.output || 0)
+  ) / 1_000_000;
+  return baseCost + longContextPremium;
 }
 
 // Backwards-compatible MODEL_PRICING export. Test at
@@ -219,6 +255,7 @@ module.exports = {
   resetPricingForTests,
   MODEL_PRICING,
   ZERO_PRICING,
+  OPENAI_LONG_CONTEXT_INPUT_THRESHOLD,
   // Internal hooks for tests.
   __getStateForTests: () => state,
 };

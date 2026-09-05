@@ -523,6 +523,8 @@
   "sessions.badge.reported_cost": "보고된 비용",
   "sessions.badge.reported_usage": "보고된 사용량",
   "sessions.badge.partial_usage": "불완전한 사용량",
+  "sessions.badge.partial_cost": "비용 불완전",
+  "sessions.cost.partial_title": "하한값 — 이 세션의 일부 모델은 공개 요금이 없어 해당 토큰은 $0으로 계산됩니다.",
   "sessions.grok.token_breakdown": "입력 {{input}} · 캐시 읽기 {{cacheRead}} · 캐시 쓰기 {{cacheWrite}} · 출력 {{output}} · 추론 {{reasoning}}",
   "sessions.grok.runtime_breakdown": "모델 호출 {{calls}}회 · API {{seconds}}초 · 도구 {{tools}}회 · 오류 {{errors}}개",
   "sessions.grok.context_breakdown": "컨텍스트 {{used}} / {{window}} ({{percent}}%)",

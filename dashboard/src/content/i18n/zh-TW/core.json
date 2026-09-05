@@ -530,6 +530,8 @@
   "sessions.badge.reported_cost": "官方費用",
   "sessions.badge.reported_usage": "官方用量",
   "sessions.badge.partial_usage": "用量不完整",
+  "sessions.badge.partial_cost": "成本不完整",
+  "sessions.cost.partial_title": "下限值 — 本工作階段中部分模型沒有公開費率，其 token 在此以 $0 計。",
   "sessions.grok.token_breakdown": "輸入 {{input}} · 快取讀取 {{cacheRead}} · 快取寫入 {{cacheWrite}} · 輸出 {{output}} · 推理 {{reasoning}}",
   "sessions.grok.runtime_breakdown": "模型呼叫 {{calls}} 次 · API {{seconds}} 秒 · 工具呼叫 {{tools}} 次 · 錯誤 {{errors}} 個",
   "sessions.grok.context_breakdown": "上下文 {{used}} / {{window}}（{{percent}}%）",

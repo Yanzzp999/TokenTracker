@@ -24,12 +24,21 @@ const {
   getExecutableName,
   buildExecStatsEntry,
 } = require("./categorizer-utils");
+const {
+  applyCodexModelEvent,
+  createCodexModelAttributionState,
+  currentCodexModel,
+  snapshotCodexModelAttributionState,
+} = require("./codex-model-attribution");
 
 const DISCOVERY_FULL_AUDIT_INTERVAL_MS = 60 * 1000;
 const MAX_DISCOVERY_INVENTORIES = 32;
 const DISCOVERY_INVENTORIES = new Map();
 const ZONED_DAY_FORMATTERS = new Map();
 const CODEX_RESUME_INVALIDATED = "TOKENTRACKER_CODEX_RESUME_INVALIDATED";
+// See src/lib/pricing/index.js: no observed Codex request reaches this
+// threshold yet (context window 258400), so long_context_* stays at zero.
+const OPENAI_LONG_CONTEXT_INPUT_THRESHOLD = 272_000;
 
 // ---------------------------------------------------------------------------
 // Timezone helpers
@@ -520,6 +529,17 @@ function finalizeExecRows(map) {
     .sort((a, b) => (b.totals?.total_tokens || 0) - (a.totals?.total_tokens || 0));
 }
 
+function finalizeModelUsageRows(map) {
+  return Array.from(map.values())
+    .map((row) => ({
+      ...row,
+      selected_models: Array.from(row.selected_models).sort(),
+      reroute_reasons: Array.from(row.reroute_reasons).sort(),
+      model_attribution: row.rerouted_usage_events > 0 ? "effective" : "selected",
+    }))
+    .sort((a, b) => b.total_tokens - a.total_tokens || a.model.localeCompare(b.model));
+}
+
 // ---------------------------------------------------------------------------
 // Main parser
 // ---------------------------------------------------------------------------
@@ -537,6 +557,9 @@ async function parseCodexRolloutFile(filePath, {
   captureContentHash = false,
   contentHashState = null,
   sourceHandle = null,
+  collectBreakdowns = true,
+  collectModelUsage = false,
+  onObject = null,
 } = {}) {
   const filePaths = (Array.isArray(filePath) ? filePath : [filePath]).filter(Boolean);
   const primaryFilePath = filePaths[0] || String(filePath || "");
@@ -566,6 +589,9 @@ async function parseCodexRolloutFile(filePath, {
   let sessionId = isResuming ? resumeState.sessionId || null : null;
   let cwd = isResuming ? resumeState.cwd || null : null;
   let model = isResuming ? resumeState.model || null : null;
+  const modelAttributionState = createCodexModelAttributionState(
+    isResuming ? resumeState.modelAttributionState || { model } : {},
+  );
   let provider = isResuming ? resumeState.provider || null : null;
   let cliVersion = isResuming ? resumeState.cliVersion || null : null;
   let forkedFromId = isResuming ? resumeState.forkedFromId || null : null;
@@ -607,8 +633,54 @@ async function parseCodexRolloutFile(filePath, {
   const byExecCommand = new Map(); // sanitized executable + subcommand -> stats
   const byExecDuration = new Map(); // duration bucket -> stats
   const byExecOutput = new Map(); // output size bucket -> stats
+  const byModel = new Map(); // effective model -> observed token usage
 
   let turnCount = 0;
+
+  function recordModelUsage(delta, rawRequestUsage) {
+    if (!collectModelUsage || !delta || delta.total_tokens <= 0) return;
+    const effectiveModel = currentCodexModel(modelAttributionState) || "unknown";
+    let row = byModel.get(effectiveModel);
+    if (!row) {
+      row = {
+        model: effectiveModel,
+        ...emptyTotals(),
+        long_context_input_tokens: 0,
+        long_context_cached_input_tokens: 0,
+        long_context_cache_creation_input_tokens: 0,
+        long_context_output_tokens: 0,
+        long_context_reasoning_output_tokens: 0,
+        usage_events: 0,
+        rerouted_usage_events: 0,
+        long_context_usage_events: 0,
+        selected_models: new Set(),
+        reroute_reasons: new Set(),
+      };
+      byModel.set(effectiveModel, row);
+    }
+    addInto(row, delta);
+    row.usage_events += 1;
+    if (modelAttributionState.selectedModel) {
+      row.selected_models.add(modelAttributionState.selectedModel);
+    }
+    if (modelAttributionState.rerouted) {
+      row.rerouted_usage_events += 1;
+      if (modelAttributionState.rerouteReason) {
+        row.reroute_reasons.add(modelAttributionState.rerouteReason);
+      }
+    }
+    // OpenAI applies the long-context tier to the whole request when its raw
+    // (cache-inclusive) input exceeds 272K tokens. Preserve the exact subset
+    // so pricing can be recomputed later without rescanning private logs.
+    if (Number(rawRequestUsage?.input_tokens || 0) > OPENAI_LONG_CONTEXT_INPUT_THRESHOLD) {
+      row.long_context_usage_events += 1;
+      row.long_context_input_tokens += delta.input_tokens;
+      row.long_context_cached_input_tokens += delta.cached_input_tokens;
+      row.long_context_cache_creation_input_tokens += delta.cache_creation_input_tokens;
+      row.long_context_output_tokens += delta.output_tokens;
+      row.long_context_reasoning_output_tokens += delta.reasoning_output_tokens;
+    }
+  }
 
   function ensureTool(name) {
     if (!byTool.has(name)) {
@@ -685,6 +757,14 @@ async function parseCodexRolloutFile(filePath, {
       return;
     }
     turnCount += 1;
+
+    if (!collectBreakdowns) {
+      addInto(totals, delta);
+      pendingToolNames = [];
+      pendingSkills = [];
+      pendingExecDetails = [];
+      return;
+    }
 
     const unique = [...new Set(pendingToolNames.filter(Boolean))];
     const tools = unique.length > 0 ? unique : ["text_response"];
@@ -822,6 +902,16 @@ async function parseCodexRolloutFile(filePath, {
     contentHasher,
     sourceHandle,
   })) {
+    const modelEvent = applyCodexModelEvent(modelAttributionState, obj);
+    const attributedModel = currentCodexModel(modelAttributionState);
+    model = attributedModel || model;
+    // onObject runs AFTER the attribution state machine, and is handed the
+    // model it just decided. A consumer sharing this pass (the delivery-signal
+    // collector, which attributes edit turns) therefore sees exactly the model
+    // recordModelUsage() bills the turn's tokens to. Letting it re-read
+    // turn_context.payload.model itself would make codex-model-attribution.js
+    // one of two authorities on the same question.
+    if (typeof onObject === "function") onObject(obj, attributedModel);
     const ts = typeof obj?.timestamp === "string" ? obj.timestamp : null;
     if (!ts) continue;
     const inRequestedRange = isTimestampInRequestedDayRange(ts, { from, to, timeZoneContext });
@@ -849,18 +939,19 @@ async function parseCodexRolloutFile(filePath, {
     if (obj.type === "turn_context") {
       const p = obj.payload || {};
       if (typeof p.cwd === "string") cwd = p.cwd;
-      if (typeof p.model === "string") model = p.model;
       continue;
     }
 
-    if (obj.type === "response_item" && obj.payload?.type === "function_call") {
+    if (modelEvent?.type === "model_rerouted") continue;
+
+    if (collectBreakdowns && obj.type === "response_item" && obj.payload?.type === "function_call") {
       pendingToolNames.push(normalizeToolName(obj.payload));
       const skill = extractSkillNameFromFunctionCall(obj.payload, diagnostics);
       if (skill) pendingSkills.push(skill);
       continue;
     }
 
-    if (obj.type === "event_msg" && obj.payload?.type === "exec_command_end") {
+    if (collectBreakdowns && obj.type === "event_msg" && obj.payload?.type === "exec_command_end") {
       const details = getExecKeys(obj.payload);
       if (details) pendingExecDetails.push(details);
       continue;
@@ -881,6 +972,7 @@ async function parseCodexRolloutFile(filePath, {
           attributeTurn(null);
         } else {
           if (seenTokenEvents && delta?.total_tokens > 0) seenTokenEvents.add(eventKey);
+          recordModelUsage(delta, lastUsage || rawDelta);
           attributeTurn(delta);
         }
       } else {
@@ -895,7 +987,7 @@ async function parseCodexRolloutFile(filePath, {
   const result = {
     sessionId: sessionId || rolloutSessionIdFromPath(primaryFilePath) || primaryFilePath,
     cwd,
-    model: model || provider,
+    model: currentCodexModel(modelAttributionState) || model || provider,
     provider,
     version: cliVersion,
     forkedFromId,
@@ -906,6 +998,7 @@ async function parseCodexRolloutFile(filePath, {
     filePath: primaryFilePath,
     turnCount,
     totals,
+    modelUsage: finalizeModelUsageRows(byModel),
     toolBreakdown: {
       tool_rows: finalizeToolRows(byTool),
     },
@@ -926,6 +1019,7 @@ async function parseCodexRolloutFile(filePath, {
       sessionId,
       cwd,
       model,
+      modelAttributionState: snapshotCodexModelAttributionState(modelAttributionState),
       provider,
       cliVersion,
       forkedFromId,

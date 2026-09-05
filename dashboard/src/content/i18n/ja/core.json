@@ -523,6 +523,8 @@
   "sessions.badge.reported_cost": "報告済みコスト",
   "sessions.badge.reported_usage": "報告済み使用量",
   "sessions.badge.partial_usage": "不完全な使用量",
+  "sessions.badge.partial_cost": "コスト不完全",
+  "sessions.cost.partial_title": "下限値 — このセッションの一部のモデルには公開レートがないため、そのトークンは $0 として計上されます。",
   "sessions.grok.token_breakdown": "入力 {{input}} · キャッシュ読取 {{cacheRead}} · キャッシュ書込 {{cacheWrite}} · 出力 {{output}} · 推論 {{reasoning}}",
   "sessions.grok.runtime_breakdown": "モデル呼出 {{calls}} 回 · API {{seconds}} 秒 · ツール {{tools}} 回 · エラー {{errors}} 件",
   "sessions.grok.context_breakdown": "コンテキスト {{used}} / {{window}}（{{percent}}%）",

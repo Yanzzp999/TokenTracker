@@ -1421,6 +1421,8 @@ sessions.badge.first_pass,ui,SessionsPage,SessionsPage,badge_first_pass,"First-p
 sessions.badge.reported_cost,ui,SessionsPage,SessionsPage,badge_reported_cost,"Reported cost",,active
 sessions.badge.reported_usage,ui,SessionsPage,SessionsPage,badge_reported_usage,"Reported usage",,active
 sessions.badge.partial_usage,ui,SessionsPage,SessionsPage,badge_partial_usage,"Partial usage",,active
+sessions.badge.partial_cost,ui,SessionsPage,SessionsPage,badge_partial_cost,"Partial cost","Tokens are fully observed but at least one model in the session has no public rate.",active
+sessions.cost.partial_title,ui,SessionsPage,SessionsPage,cost_partial_title,"Lower bound - some models in this session have no public rate, so their tokens cost $0 here.","Tooltip on the greater-or-equal cost marker.",active
 sessions.grok.token_breakdown,ui,SessionsPage,SessionsPage,grok_token_breakdown,"Input {{input}} · Cache read {{cacheRead}} · Cache write {{cacheWrite}} · Output {{output}} · Reasoning {{reasoning}}",,active
 sessions.grok.runtime_breakdown,ui,SessionsPage,SessionsPage,grok_runtime_breakdown,"Model calls {{calls}} · API {{seconds}}s · Tools {{tools}} · Errors {{errors}}",,active
 sessions.grok.context_breakdown,ui,SessionsPage,SessionsPage,grok_context_breakdown,"Context {{used}} / {{window}} ({{percent}}%)",,active

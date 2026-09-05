@@ -3996,9 +3996,50 @@ test("parseRolloutIncremental subtracts cached_input_tokens from Codex input_tok
     assert.equal(queued[0].cached_input_tokens, 950_000);
     assert.equal(queued[0].output_tokens, 10_000);
     assert.equal(queued[0].reasoning_output_tokens, 4_000);
-    // total_tokens left as reported: still equals non_cached + cached + output
-    // numerically, so downstream aggregation stays stable.
+    // The reported total already equals the normalized, mutually-exclusive parts.
     assert.equal(queued[0].total_tokens, 1_010_000);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("parseRolloutIncremental drops Codex total-only sentinel usage", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-codex-total-sentinel-"));
+  try {
+    const rolloutPath = path.join(tmp, "rollout-codex.jsonl");
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const cursors = { version: 1, files: {}, updatedAt: null };
+    const zero = {
+      input_tokens: 0,
+      cached_input_tokens: 0,
+      cache_write_input_tokens: 0,
+      output_tokens: 0,
+      reasoning_output_tokens: 0,
+      total_tokens: 0,
+    };
+    const sentinel = { ...zero, total_tokens: 4_442 };
+    const valid = { ...zero, input_tokens: 100, output_tokens: 10, total_tokens: 110 };
+
+    await fs.writeFile(
+      rolloutPath,
+      [
+        buildTokenCountLine({ ts: "2026-08-04T12:58:55.420Z", last: sentinel, total: zero }),
+        buildTokenCountLine({ ts: "2026-08-04T12:59:06.736Z", last: valid, total: valid }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    await parseRolloutIncremental({
+      rolloutFiles: [{ path: rolloutPath, source: "codex" }],
+      cursors,
+      queuePath,
+    });
+
+    const queued = await readJsonLines(queuePath);
+    assert.equal(queued.length, 1);
+    assert.equal(queued[0].input_tokens, 100);
+    assert.equal(queued[0].output_tokens, 10);
+    assert.equal(queued[0].total_tokens, 110);
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }
@@ -4140,6 +4181,56 @@ test("parseRolloutIncremental keeps buckets separate per model within the same h
     assert.ok(byModel.has("gpt-4o-mini"));
     assert.equal(byModel.get("gpt-4o").total_tokens, usage1.total_tokens);
     assert.equal(byModel.get("gpt-4o-mini").total_tokens, usage2.total_tokens);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("parseRolloutIncremental persists selected-model state and bills an observed reroute to the effective model", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-codex-reroute-"));
+  try {
+    const rolloutPath = path.join(tmp, "rollout-reroute.jsonl");
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const cursors = { version: 1, files: {}, updatedAt: null };
+    await fs.writeFile(
+      rolloutPath,
+      `${buildTurnContextLine({ model: "gpt-5.6-sol" })}\n`,
+      "utf8",
+    );
+    await parseRolloutIncremental({ rolloutFiles: [rolloutPath], cursors, queuePath });
+
+    const usage = {
+      input_tokens: 100,
+      cached_input_tokens: 0,
+      output_tokens: 20,
+      reasoning_output_tokens: 0,
+      total_tokens: 120,
+    };
+    const reroute = JSON.stringify({
+      timestamp: "2025-12-17T00:04:59.000Z",
+      method: "model/rerouted",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        fromModel: "gpt-5.6-sol",
+        toModel: "gpt-5.6-terra",
+        reason: "capacity",
+      },
+    });
+    await fs.appendFile(
+      rolloutPath,
+      `${reroute}\n${buildTokenCountLine({ ts: "2025-12-17T00:05:00.000Z", last: usage, total: usage })}\n`,
+      "utf8",
+    );
+    await parseRolloutIncremental({ rolloutFiles: [rolloutPath], cursors, queuePath });
+
+    const queued = await readJsonLines(queuePath);
+    assert.equal(queued.length, 1);
+    assert.equal(queued[0].model, "gpt-5.6-terra");
+    assert.equal(queued[0].total_tokens, 120);
+    const cursor = cursors.files[rolloutPath];
+    assert.equal(cursor.modelAttributionState.selectedModel, "gpt-5.6-sol");
+    assert.equal(cursor.modelAttributionState.effectiveModel, "gpt-5.6-terra");
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }

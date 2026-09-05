@@ -520,6 +520,8 @@
   "sessions.badge.reported_cost": "Gemeldete Kosten",
   "sessions.badge.reported_usage": "Gemeldete Nutzung",
   "sessions.badge.partial_usage": "Unvollständige Nutzung",
+  "sessions.badge.partial_cost": "Teilkosten",
+  "sessions.cost.partial_title": "Untergrenze — für einige Modelle dieser Sitzung gibt es keinen öffentlichen Tarif, ihre Tokens zählen hier $0.",
   "sessions.grok.token_breakdown": "Eingabe {{input}} · Cache-Lesen {{cacheRead}} · Cache-Schreiben {{cacheWrite}} · Ausgabe {{output}} · Reasoning {{reasoning}}",
   "sessions.grok.runtime_breakdown": "Modellaufrufe {{calls}} · API {{seconds}} s · Tools {{tools}} · Fehler {{errors}}",
   "sessions.grok.context_breakdown": "Kontext {{used}} / {{window}} ({{percent}} %)",
